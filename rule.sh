@@ -14,6 +14,10 @@ ip -4 rule add to 192.168.0.0/17 priority ${PRIORITY}
 ip -4 rule add to 198.18.0.0/15 priority ${PRIORITY}
 ip -4 rule add to 224.0.0.0/4 priority ${PRIORITY}
 ip -4 rule add to 255.255.255.255/32 priority ${PRIORITY}
+ip -6 rule add to fc00::/7 priority ${PRIORITY}
+ip -6 rule add to fe80::/10 priority ${PRIORITY}
+ip -6 rule add to fec0::/10 priority ${PRIORITY}
+ip -6 rule add to ff00::/8 priority ${PRIORITY}
 ip -6 rule add to 2001:7fa:5::/48 priority ${PRIORITY}
 ip -6 rule add to 2001:7fa:10::/48 priority ${PRIORITY}
 ip -6 rule add to 2001:dd8:1::/48 priority ${PRIORITY}
@@ -1078,6 +1082,7 @@ ip -6 rule add to 2404:d80::/32 priority ${PRIORITY}
 ip -6 rule add to 2404:f00::/32 priority ${PRIORITY}
 ip -6 rule add to 2404:f80::/32 priority ${PRIORITY}
 ip -6 rule add to 2404:1080::/32 priority ${PRIORITY}
+ip -6 rule add to 2404:10c0::/32 priority ${PRIORITY}
 ip -6 rule add to 2404:1180::/32 priority ${PRIORITY}
 ip -6 rule add to 2404:1880::/32 priority ${PRIORITY}
 ip -6 rule add to 2404:1c80::/32 priority ${PRIORITY}
@@ -6023,6 +6028,7 @@ ip -4 rule add to 103.126.100.0/22 priority ${PRIORITY}
 ip -4 rule add to 103.126.124.0/22 priority ${PRIORITY}
 ip -4 rule add to 103.126.128.0/22 priority ${PRIORITY}
 ip -4 rule add to 103.126.132.0/22 priority ${PRIORITY}
+ip -4 rule add to 103.126.208.0/22 priority ${PRIORITY}
 ip -4 rule add to 103.129.52.0/22 priority ${PRIORITY}
 ip -4 rule add to 103.129.148.0/22 priority ${PRIORITY}
 ip -4 rule add to 103.130.132.0/22 priority ${PRIORITY}
