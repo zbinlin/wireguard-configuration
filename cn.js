@@ -51,6 +51,8 @@ function output(ary) {
     console.log(`PRIORITY=$\{PRIORITY:-${PRIORITY}}`);
 
     const otherAddresses = [
+        /** IPv4 **/
+
         '1.1.1.1', '1.0.0.1', /* Cloudflare DNS */
         '8.8.8.8', '8.8.4.4', /* Google DNS */
         '9.9.9.9', '149.112.112.112', /* Qua9 DNS */
@@ -64,6 +66,12 @@ function output(ary) {
         '198.18.0.0/15', /* Private network */
         '224.0.0.0/4', /* IP multicast */
         '255.255.255.255/32',
+
+        /** IPv6 **/
+        'fc00::/7', /* Unique local addresses */
+        'fe80::/10', /* Link-local addresses */
+        'fec0::/10', /* Site-local addresses */
+        'ff00::/8', /* Multicast addresses */
     ];
     for (const r of otherAddresses) {
         const type = r.indexOf(':') >= 0 ? '6' : '4';
