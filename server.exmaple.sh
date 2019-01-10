@@ -1,12 +1,12 @@
 sysctl -w net.ipv4.ip_forward=1
 iptables -t nat -A POSTROUTING -o $I -j MASQUERADE
 iptables -t filter -A FORWARD -i wg+ -j ACCEPT
-iptables -t filter -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+iptables -t filter -A FORWARD -o wg+ -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 
 sysctl -w net.ipv6.conf.all.accept_ra=2 net.ipv6.conf.default.accept_ra=2 net.ipv6.conf.all.forwarding=1 net.ipv6.conf.default.forwarding=1
 ip6tables -t nat -A POSTROUTING -o $I -j MASQUERADE
 ip6tables -t filter -A FORWARD -i wg+ -j ACCEPT
-ip6tables -t filter -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+ip6tables -t filter -A FORWARD -o wg+ -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 
 
 firewall-cmd --zone=public --add-port=853/upd --permanent
