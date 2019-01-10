@@ -1,6 +1,6 @@
 #!/bin/bash
 
-echo Delete rules...
+echo Delete rules... >&2
 cd "$(dirname ${BASH_SOURCE[0]})"
 source ./clean.sh
-echo Done
+echo Delete rules done. >&2

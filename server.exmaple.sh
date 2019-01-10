@@ -18,3 +18,5 @@ firewall-cmd --direct --permanent --add-rule ipv4 filter FORWARD 0 -o wg+ -m sta
 
 firewall-cmd --direct --permanent --add-rule ipv4 filter FORWARD 0 -i tun+ -j ACCEPT
 firewall-cmd --direct --permanent --add-rule ipv4 filter FORWARD 0 -o tun+ -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+iptables -t filter -A INPUT -p udp --dport 49152:65535 -j ACCEPT

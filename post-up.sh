@@ -1,6 +1,6 @@
 #!/bin/bash
 
-echo Add rules...
+echo Add rules... >&2
 cd "$(dirname ${BASH_SOURCE[0]})"
 source ./rule.sh
-echo Done
+echo Add rules done. >&2
