@@ -6,13 +6,15 @@ REMOTE_PORT=${REMOTE_PORT:-12345}
 IPV4_ADDRESS=${IPV4_ADDRESS:-"192.168.129.254/24"}
 IPV6_ADDRESS=${IPV6_ADDRESS:-"fdff:eedd:ccbb::ffff/64"}
 
-INTERFACE=wg1rnd
+INTERFACE=${INTERFACE:-"wg1"}
+RND_INTERFACE="${INTERFACE}rnd"
 CONFIG_FILE_DIR=$(mktemp -d)
 chmod 0700 ${CONFIG_FILE_DIR}
 
-CONFIG_FILE_PATH="${CONFIG_FILE_DIR}/${INTERFACE}.conf"
+CONFIG_FILE_PATH="${CONFIG_FILE_DIR}/${RND_INTERFACE}.conf"
 
 __cleanup() {
+    wg-quick down ${INTERFACE} 2>/dev/null
     wg-quick down "${CONFIG_FILE_PATH}"
     [[ -d "${CONFIG_FILE_DIR}" ]] && rm -r "${CONFIG_FILE_DIR}"
 }
@@ -52,20 +54,20 @@ EOF
     echo "${conf}" > "${CONFIG_FILE_PATH}"
 }
 
-wg-quick down wg1 2>/dev/null
+wg-quick down $INTERFACE 2>/dev/null
 while true;
 do
     echo Updating...
     wg-quick down "${CONFIG_FILE_PATH}" 2>/dev/null
-    wg-quick up wg1
+    wg-quick up $INTERFACE
     up=$?
     [[ $up -ne 0 ]] && {
-        echo "Error: Could not up wg1!" >&2
+        echo "Error: Could not up $INTERFACE!" >&2
         exit 1
     }
     update
     success=$?
-    wg-quick down wg1 2>/dev/null
+    wg-quick down $INTERFACE 2>/dev/null
     if [[ $success -eq 0 ]];
     then
         wg-quick up "${CONFIG_FILE_PATH}"
