@@ -15,6 +15,6 @@ postend() {
 }
 
 prestart
-trap '' HUP INT QUIT KILL TERM
+trap 'trap postend EXIT' HUP INT QUIT KILL TERM
 trap postend EXIT
 socat EXEC:./server.sh,pty,rawer TCP-LISTEN:12345,bind=192.168.128.1,fork,reuseaddr
