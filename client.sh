@@ -75,7 +75,7 @@ do
         sleep $((300 + $RANDOM % 600)) # 5~15 minutes
     else
         echo "Could not up ${CONFIG_FILE_PATH}!"
-        echo "Try agent..."
+        echo "Try again after 10 seconds..."
         sleep 10
     fi
 done
