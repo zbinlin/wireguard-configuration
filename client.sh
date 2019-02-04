@@ -19,7 +19,9 @@ __cleanup() {
     [[ -d "${CONFIG_FILE_DIR}" ]] && rm -r "${CONFIG_FILE_DIR}"
 }
 
+trap 'trap __cleanup EXIT' HUP INT QUIT KILL TERM
 trap __cleanup EXIT
+
 
 update() {
     private_key=$(wg genkey)
