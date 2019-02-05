@@ -14,12 +14,14 @@ chmod 0700 ${CONFIG_FILE_DIR}
 CONFIG_FILE_PATH="${CONFIG_FILE_DIR}/${RND_INTERFACE}.conf"
 
 __cleanup() {
+    ret=$?
     wg-quick down ${INTERFACE} 2>/dev/null
     wg-quick down "${CONFIG_FILE_PATH}"
     [[ -d "${CONFIG_FILE_DIR}" ]] && rm -r "${CONFIG_FILE_DIR}"
+    exit $ret
 }
 
-trap 'trap __cleanup EXIT' HUP INT QUIT KILL TERM
+trap '__=$? && trap __cleanup EXIT && exit $__' HUP INT QUIT KILL TERM
 trap __cleanup EXIT
 
 
