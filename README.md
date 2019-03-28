@@ -4,6 +4,7 @@
 Requirements:
 
 * socat
+* nmap
 * iptables/ip6tables
 
 ```sh
