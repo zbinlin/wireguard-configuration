@@ -27,7 +27,8 @@ printf 'Please enter peer allowed ips: [192.168.128.2/32] '
 read peer_allowed_ips
 : ${peer_allowed_ips:='192.168.128.2/32'}
 
-cat > /etc/wireguard/${wg_cfg_name}.conf <<EOF
+config_file_path="/etc/wireguard/${wg_cfg_name}.conf"
+config=$(printf "\
 [Interface]
 Address = ${address}
 PrivateKey = ${private_key}
@@ -35,5 +36,23 @@ ListenPort = ${listen_port}
 
 [Peer]
 PublicKey = ${peer_public_key}
-AllowedIPs = ${peer_allowed_ips}
-EOF
+AllowedIPs = ${peer_allowed_ips}\
+")
+
+if [ -f "${config_file_path}" ];
+then
+	printf "Warning! ${config_file_path} already exists, do you override it? [y/N] "
+	read confirm
+	confirm=$(printf "${confirm}" | tr '[:upper:]' '[:lower:]')
+	if [ "${confirm}" = "y" -o "${confirm}" = "yes" ];
+	then
+		# Ignore
+		:;
+	else
+		echo "${config}"
+		exit
+	fi
+fi
+
+echo "${config}" > "${config_file_path}"
+echo Saved to ${config_file_path}
