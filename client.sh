@@ -5,6 +5,7 @@ REMOTE_HOSTNAME=${REMOTE_HOSTNAME:-"192.168.128.1"}
 REMOTE_PORT=${REMOTE_PORT:-12345}
 IPV4_ADDRESS=${IPV4_ADDRESS:-"192.168.129.254/24"}
 IPV6_ADDRESS=${IPV6_ADDRESS:-"fdff:eedd:ccbb::ffff/64"}
+MTU=${MTU:-1420}
 
 INTERFACE=${INTERFACE:-"wg1"}
 RND_INTERFACE="${INTERFACE}rnd"
@@ -44,6 +45,7 @@ update() {
 PrivateKey = ${private_key}
 Address = ${IPV4_ADDRESS}
 Address = ${IPV6_ADDRESS}
+MTU = ${MTU}
 PostUp = export PRIORITY=1024; source ${DIR}/post-up.sh
 PreDown = export PRIORITY=1024; source ${DIR}/pre-down.sh
 
