@@ -28,8 +28,10 @@ trap __cleanup EXIT
 
 update() {
     private_key=$(wg genkey)
-    ret=$(echo "INIT" "$(wg pubkey <<<${private_key})" | ncat ${REMOTE_HOSTNAME} ${REMOTE_PORT})
 
+    echo "Sending public key and Receiving remote public key..." >&2
+
+    ret=$(echo "INIT" "$(wg pubkey <<<${private_key})" | ncat -w 10s ${REMOTE_HOSTNAME} ${REMOTE_PORT})
     read -r method remote_pubkey port <<<"${ret}"
 
     echo "Response: ${method} ${remote_pubkey} ${port}" >&2
