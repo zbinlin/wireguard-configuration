@@ -20,3 +20,12 @@ firewall-cmd --direct --permanent --add-rule ipv4 filter FORWARD 0 -i tun+ -j AC
 firewall-cmd --direct --permanent --add-rule ipv4 filter FORWARD 0 -o tun+ -m state --state RELATED,ESTABLISHED -j ACCEPT
 
 iptables -t filter -A INPUT -p udp --dport 49152:65535 -j ACCEPT
+
+
+# nftables
+nft add table inet wg-random-port
+nft add chain inet wg-random-port forward \{ type filter hook forward priority filter - 1 \;\}
+nft add rule inet wg-random-port forward meta iifname "wg*" accept
+nft add rule inet wg-random-port forward ct state \{ established, related \} meta oifname "wg*" accept
+nft add chain inet wg-random-port postrouting \{ type nat hook postrouting priority srcnat \;\}
+nft add rule inet wg-random-port postrouting meta iifname "wg*" meta oifname != "wg*" masquerade
