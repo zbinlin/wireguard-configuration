@@ -1,0 +1,57 @@
+#!/usr/bin/nft -f
+
+include "./var.nft"
+
+table inet wg.domestic
+delete table inet wg.domestic
+table inet wg.domestic {
+    set v4 {
+        type ipv4_addr
+        flags constant, interval
+        elements = $IPV4_ELEMENTS
+    }
+
+    set v6 {
+        type ipv6_addr
+        flags constant, interval
+        elements = $IPV6_ELEMENTS
+    }
+
+    chain try_restore_mark {
+        ct mark & $FWMARK == $FWMARK meta mark set ct mark
+        ct mark & $FWMARK != $FWMARK ip daddr != @v4 meta mark set mark | $FWMARK
+        ct mark & $FWMARK != $FWMARK ip6 daddr != @v6 meta mark set mark | $FWMARK
+    }
+
+    chain try_save_mark {
+        ct mark & $FWMARK != $FWMARK meta mark & $FWMARK == $FWMARK ct mark set meta mark
+    }
+
+    chain filter.prerouting.mangle {
+        type filter hook prerouting priority mangle
+        #meta nftrace set 1
+
+        jump try_restore_mark
+    }
+
+    chain route.output.mangle {
+        type route hook output priority mangle
+        #meta nftrace set 1
+
+        jump try_restore_mark
+    }
+
+    chain filter.postrouting.mangle {
+        type filter hook postrouting priority mangle
+        #meta nftrace set 1
+
+        jump try_save_mark
+    }
+
+    chain nat.postrouting.srcnat {
+        type nat hook postrouting priority srcnat
+        #meta nftrace set 1
+
+        meta mark & $FWMARK == $FWMARK masquerade
+    }
+}
