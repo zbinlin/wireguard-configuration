@@ -2,7 +2,7 @@
 
 set -e
 
-ADDRESS=127.0.0.1
+ADDRESS=192.168.128.1
 export PORT=12345
 export INTERFACE="wg0rand"
 
