@@ -1,6 +1,6 @@
 #!/bin/sh -e
 
-./install.sh
+./install-tools.sh
 
 mkdir -p /etc/wireguard
 

@@ -4,6 +4,7 @@ set -e
 
 case $1 in
     (up)
+        cd "$( dirname "${BASH_SOURCE[0]}" )"
         nft -f ./domestic.nft || true
         ip -4 route add 0.0.0.0/0 dev $WG_DEV table $FWMARK
         ip -6 route add ::/0 dev $WG_DEV table $FWMARK

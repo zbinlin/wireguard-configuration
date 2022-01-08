@@ -1,6 +1,6 @@
 #!/usr/bin/nft -f
 
-include "./var.nft"
+include "./data/var.nft"
 
 table inet wg.domestic
 delete table inet wg.domestic

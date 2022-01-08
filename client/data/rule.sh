@@ -1,10 +1,15 @@
 PRIORITY=${PRIORITY:-1024}
-ip -4 rule add to 1.1.1.1 priority ${PRIORITY}
-ip -4 rule add to 1.0.0.1 priority ${PRIORITY}
-ip -4 rule add to 8.8.8.8 priority ${PRIORITY}
-ip -4 rule add to 8.8.4.4 priority ${PRIORITY}
-ip -4 rule add to 9.9.9.9 priority ${PRIORITY}
-ip -4 rule add to 149.112.112.112 priority ${PRIORITY}
+ip -4 rule add to 172.67.166.20/32 priority ${PRIORITY}
+ip -4 rule add to 104.21.16.37/32 priority ${PRIORITY}
+ip -6 rule add to 2606:4700:3036::ac43:a614/128 priority ${PRIORITY}
+ip -6 rule add to 2606:4700:3030::6815:1025/128 priority ${PRIORITY}
+#ip -4 rule add to 1.1.1.1 priority ${PRIORITY}
+#ip -4 rule add to 1.0.0.1 priority ${PRIORITY}
+#ip -4 rule add to 8.8.8.8 priority ${PRIORITY}
+#ip -4 rule add to 8.8.4.4 priority ${PRIORITY}
+#ip -4 rule add to 9.9.9.9 priority ${PRIORITY}
+#ip -4 rule add to 149.112.112.112 priority ${PRIORITY}
+ip -6 rule add to 2606:4700:4700::/64 priority ${PRIORITY}
 ip -4 rule add to 0.0.0.0/8 priority ${PRIORITY}
 ip -4 rule add to 10.0.0.0/8 priority ${PRIORITY}
 ip -4 rule add to 100.64.0.0/10 priority ${PRIORITY}
