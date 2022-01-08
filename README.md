@@ -10,6 +10,8 @@ Requirements:
 ```sh
 # socat EXEC:./server.sh,pty,rawer TCP-LISTEN:12345,bind=192.168.128.1,fork,reuseaddr
 ./start-server.sh
+# or
+sudo ./start-server.sh
 ```
 
 ## Client side
@@ -18,7 +20,7 @@ Requirements:
 export ENDPOINT=<...>
 export REMOTE_HOSTNAME=192.168.128.1
 export REMOTE_PORT=12345
-./client.sh
+./start-client.sh
 ```
 
 ## Alt
