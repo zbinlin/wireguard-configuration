@@ -3,6 +3,7 @@
 IPV4_ADDRESS=${IPV4_ADDRESS:-"192.168.129.1/24"}
 IPV6_ADDRESS=${IPV6_ADDRESS:-"fdff:eedd:ccbb::1/64"}
 ALLOWED_IPS=${ALLOWED_IPS:-"192.168.129.254/32, fdff:eedd:ccbb::ffff/128"}
+MTU=${MTU:-1420}
 
 INTERFACE=${INTERFACE:-"wg0rnd"}
 MIN_PORT=${MIN_PORT:-49152}
@@ -40,6 +41,7 @@ do
 PrivateKey = ${private_key}
 Address = ${IPV4_ADDRESS}
 Address = ${IPV6_ADDRESS}
+MTU = ${MTU}
 ListenPort = ${port}
 
 [Peer]
