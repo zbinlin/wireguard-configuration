@@ -101,6 +101,7 @@ PrivateKey = ${private_key}
 Address = ${IPV4_ADDRESS}
 Address = ${IPV6_ADDRESS}
 MTU = ${MTU}
+FwMark = 4096
 ${hooks}
 
 [Peer]
