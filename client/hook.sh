@@ -52,10 +52,10 @@ case $1 in
         nft -f ./domestic.nft
         ip -4 route add 0.0.0.0/0 dev $WG_DEV table $FWMARK
         ip -6 route add ::/0 dev $WG_DEV table $FWMARK
-        ip -4 rule add fwmark $FWMARK table $FWMARK
-        ip -6 rule add fwmark $FWMARK table $FWMARK
         ip -4 rule add table main suppress_prefixlength 0
         ip -6 rule add table main suppress_prefixlength 0
+        ip -4 rule add fwmark $FWMARK table $FWMARK
+        ip -6 rule add fwmark $FWMARK table $FWMARK
         if [[ $endpoint_is_ipv6 == TRUE ]]
         then
             ip -6 rule add to $ENDPOINT table main
@@ -70,10 +70,10 @@ case $1 in
         else
             ip -4 rule delete to $ENDPOINT table main || true
         fi
-        ip -6 rule delete table main suppress_prefixlength 0 || true
-        ip -4 rule delete table main suppress_prefixlength 0 || true
         ip -6 rule delete fwmark $FWMARK table $FWMARK || true
         ip -4 rule delete fwmark $FWMARK table $FWMARK || true
+        ip -6 rule delete table main suppress_prefixlength 0 || true
+        ip -4 rule delete table main suppress_prefixlength 0 || true
         nft delete table inet wg.domestic || true
         ;;
     (*)
