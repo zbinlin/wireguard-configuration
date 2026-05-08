@@ -31,7 +31,7 @@ then
 			;;
 		'Arch' )
 			echo 'Installing...'
-			pacman -Sy --confirm wireguard-arch wireguard-tools
+			pacman -Sy --confirm wireguard-tools
 			;;
 		* )
 			echo 'Please install wireguard from https://www.wireguard.com manually.'
