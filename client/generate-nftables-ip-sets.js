@@ -88,6 +88,8 @@ function output(ary) {
         //'8.8.8.8', '8.8.4.4', /* Google DNS */
         //'9.9.9.9', '149.112.112.112', /* Qua9 DNS */
 
+        '8.128.0.0/11', /* Alibaba cloud */
+
         '0.0.0.0/8', /* Current network (From wiki) */
         '127.0.0.0/8', /* Loopback */
         '10.0.0.0/8', /* Private Internet Address */
