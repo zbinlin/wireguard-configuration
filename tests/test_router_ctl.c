@@ -252,6 +252,13 @@ static void test_lan_ifaces(void) {
     remove_lan_iface(&list, "br0");
     assert(list.count == 0);
 
+    /* 6. Truncated name dedup check */
+    struct lan_ifaces long_list = {0};
+    add_lan_iface(&long_list, "interface_name_very_long_1");
+    add_lan_iface(&long_list, "interface_name_very_long_2");
+    /* Since first 15 chars are identical ("interface_name_"), second must be deduplicated */
+    assert(long_list.count == 1);
+
     char path[512];
     snprintf(path, sizeof(path), "%s/%s", test_dir, LAN_IFACES_FILENAME);
     unlink(path);

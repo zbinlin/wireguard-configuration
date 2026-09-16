@@ -34,6 +34,8 @@ struct {
     __type(value, struct router_config);
 } router_config_map SEC(".maps");
 
+/* Pinned map used for userspace LAN interface bookkeeping (status/add-if/del-if);
+ * not accessed in-kernel by packet processing logic. */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, MAX_LAN_IFACES);
@@ -172,16 +174,19 @@ int tc_router_ingress(struct __sk_buff *skb) {
     __u16 proto = bpf_ntohs(eth->h_proto);
     void *nh = eth + 1;
 
-    /* Handle 802.1Q and 802.1ad VLAN encapsulations */
-    if (proto == ETH_P_8021Q || proto == ETH_P_8021AD) {
-        struct {
-            __be16 tci;
-            __be16 encap_proto;
-        } *vlan = nh;
-        if ((void *)(vlan + 1) > data_end)
-            return TC_ACT_OK;
-        proto = bpf_ntohs(vlan->encap_proto);
-        nh = vlan + 1;
+    /* Handle 802.1Q and 802.1ad VLAN encapsulations (supports up to 2 tags for QinQ) */
+    #pragma unroll
+    for (int i = 0; i < 2; i++) {
+        if (proto == ETH_P_8021Q || proto == ETH_P_8021AD) {
+            struct {
+                __be16 tci;
+                __be16 encap_proto;
+            } *vlan = nh;
+            if ((void *)(vlan + 1) > data_end)
+                return TC_ACT_OK;
+            proto = bpf_ntohs(vlan->encap_proto);
+            nh = vlan + 1;
+        }
     }
 
     if (proto == ETH_P_IP) {
@@ -192,7 +197,8 @@ int tc_router_ingress(struct __sk_buff *skb) {
             return TC_ACT_OK;
 
         __u16 dst_port = 0;
-        if (iph->protocol == IPPROTO_UDP) {
+        /* Only inspect UDP destination port if this is not a subsequent fragment (offset == 0) */
+        if (iph->protocol == IPPROTO_UDP && (bpf_ntohs(iph->frag_off) & 0x1fff) == 0) {
             void *trans = (void *)iph + ((iph->ihl & 0x0f) * 4);
             struct udphdr *udp = trans;
             if ((void *)(udp + 1) <= data_end) {
@@ -213,6 +219,9 @@ int tc_router_ingress(struct __sk_buff *skb) {
             return TC_ACT_OK;
 
         __u16 dst_port = 0;
+        /* Inspect immediate UDP next-header. Extension headers (hop-by-hop, routing)
+         * are not walked; in that corner case dst_port remains 0 (matching any-port WG endpoint),
+         * while destination address bypass always applies. */
         if (ip6h->nexthdr == IPPROTO_UDP) {
             struct udphdr *udp = (void *)(ip6h + 1);
             if ((void *)(udp + 1) <= data_end) {
