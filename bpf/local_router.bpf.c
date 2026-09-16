@@ -37,7 +37,6 @@ struct {
     __uint(max_entries, 1);
     __type(key, __u32);
     __type(value, struct wg_endpoint);
-    __uint(pinning, LIBBPF_PIN_BY_NAME);
 } wg_endpoint_map SEC(".maps");
 
 struct {
@@ -46,7 +45,6 @@ struct {
     __type(key, struct ipv4_lpm_key);
     __type(value, __u8);
     __uint(map_flags, BPF_F_NO_PREALLOC);
-    __uint(pinning, LIBBPF_PIN_BY_NAME);
 } bypass_v4_map SEC(".maps");
 
 struct {
@@ -55,7 +53,6 @@ struct {
     __type(key, struct ipv6_lpm_key);
     __type(value, __u8);
     __uint(map_flags, BPF_F_NO_PREALLOC);
-    __uint(pinning, LIBBPF_PIN_BY_NAME);
 } bypass_v6_map SEC(".maps");
 
 struct {
@@ -63,7 +60,6 @@ struct {
     __uint(max_entries, 1);
     __type(key, __u32);
     __type(value, struct router_config);
-    __uint(pinning, LIBBPF_PIN_BY_NAME);
 } router_config_map SEC(".maps");
 
 static __always_inline void apply_mark(struct bpf_sock_addr *ctx) {
