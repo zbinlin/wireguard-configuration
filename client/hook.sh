@@ -72,6 +72,15 @@ case $1 in
                 --pin-dir /sys/fs/bpf/wg_routing \
                 --wg-endpoint $ENDPOINT \
                 --rule-file ${DIR}/data/var.nft
+            nft -f - <<EOF
+destroy table inet ebpf.wg.forward;
+table inet ebpf.wg.forward {
+    chain net.postrouting.srcnat {
+        type nat hook postrouting priority srcnat; policy accept;
+        fib saddr type != local oifname ${WG_DEV} masquerade;
+    }
+}
+EOF
         else
             nft -f ${DIR}/domestic.nft
         fi
@@ -102,6 +111,7 @@ case $1 in
         if [[ ${METHOD} == "ebpf" ]];
         then
             ${DIR}/ebpf-routing/router-ctl.sh stop --pin-dir /sys/fs/bpf/wg_routing || true
+            nft destroy table inet ebpf.wg.forward || true
         else
             nft destroy table inet wg.domestic || nft delete table inet wg.domestic || true
         fi
