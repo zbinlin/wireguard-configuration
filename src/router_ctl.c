@@ -18,7 +18,12 @@
 #include "router_common.h"
 #include "local_router.skel.h"
 
+static bool g_suppress_libbpf_log = false;
+
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args) {
+    if (g_suppress_libbpf_log)
+        return 0;
+
     if (level == LIBBPF_DEBUG && !getenv("LIBBPF_DEBUG"))
         return 0;
 
@@ -28,9 +33,13 @@ static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va
     vsnprintf(buf, sizeof(buf), format, args_copy);
     va_end(args_copy);
 
-    /* "Exclusivity flag on, cannot modify" is sent via netlink extack when clsact qdisc
-     * already exists on the interface during bpf_tc_hook_create(). It is benign and expected. */
-    if (strstr(buf, "Exclusivity flag on, cannot modify")) {
+    /* Suppress benign Netlink extack messages triggered during TC hook probing,
+     * attachment, and detachment (e.g. non-existent hooks or non-matching filter priorities) */
+    if (strstr(buf, "Exclusivity flag on, cannot modify") ||
+        strstr(buf, "Parent Qdisc doesn't exists") ||
+        strstr(buf, "Parent Qdisc doesn't exist") ||
+        strstr(buf, "Filter with specified priority/protocol not found") ||
+        strstr(buf, "No such file or directory")) {
         return 0;
     }
 
@@ -299,6 +308,7 @@ static int tc_detach_interface(const char *ifname) {
         .handle = 1,
         .priority = 1,
     };
+    g_suppress_libbpf_log = true;
     bpf_tc_detach(&hook, &opts);
     opts.priority = 49152;
     bpf_tc_detach(&hook, &opts);
@@ -306,6 +316,7 @@ static int tc_detach_interface(const char *ifname) {
     opts.priority = 0;
     bpf_tc_detach(&hook, &opts);
     bpf_tc_hook_destroy(&hook);
+    g_suppress_libbpf_log = false;
     return 0;
 }
 
@@ -320,7 +331,10 @@ static bool query_tc_filter(int ifindex, uint32_t handle, uint32_t priority, uin
         .handle = handle,
         .priority = priority,
     };
-    if (bpf_tc_query(&hook, &opts) == 0) {
+    g_suppress_libbpf_log = true;
+    int ret = bpf_tc_query(&hook, &opts);
+    g_suppress_libbpf_log = false;
+    if (ret == 0) {
         if (expected_prog_id > 0) {
             return opts.prog_id == expected_prog_id;
         }
