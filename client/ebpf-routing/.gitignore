@@ -1,0 +1,20 @@
+# Build output directory
+build/
+target/
+
+# Object files and generated skeletons
+*.o
+*.skel.h
+router_ctl
+router_loader
+
+# Generated kernel headers (generated on-the-fly via bpftool btf dump)
+bpf/vmlinux.h
+vmlinux.h
+
+# Editor and OS files
+.DS_Store
+*.swp
+*~
+.vscode/
+.idea/
