@@ -5,7 +5,7 @@ BPFTOOL ?= bpftool
 ARCH ?= $(shell uname -m | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/')
 BUILD_DIR ?= build
 
-BPF_CFLAGS = -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH) -Wno-missing-declarations -I$(BUILD_DIR) -I/usr/include
+BPF_CFLAGS = -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH) -Wno-missing-declarations -Iinclude -I$(BUILD_DIR) -I/usr/include
 LDFLAGS = -lbpf -lelf -lz
 
 all: $(BUILD_DIR)/router_ctl
@@ -16,16 +16,22 @@ $(BUILD_DIR):
 $(BUILD_DIR)/vmlinux.h: | $(BUILD_DIR)
 	$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format c > $@
 
-$(BUILD_DIR)/local_router.bpf.o: bpf/local_router.bpf.c $(BUILD_DIR)/vmlinux.h | $(BUILD_DIR)
+$(BUILD_DIR)/local_router.bpf.o: bpf/local_router.bpf.c include/router_common.h $(BUILD_DIR)/vmlinux.h | $(BUILD_DIR)
 	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/local_router.skel.h: $(BUILD_DIR)/local_router.bpf.o | $(BUILD_DIR)
 	$(BPFTOOL) gen skeleton $< > $@
 
-$(BUILD_DIR)/router_ctl: src/router_ctl.c $(BUILD_DIR)/local_router.skel.h | $(BUILD_DIR)
-	$(GCC) -O2 -I$(BUILD_DIR) -Isrc -I. $< $(LDFLAGS) -o $@
+$(BUILD_DIR)/router_ctl: src/router_ctl.c include/router_common.h $(BUILD_DIR)/local_router.skel.h | $(BUILD_DIR)
+	$(GCC) -O2 -Iinclude -I$(BUILD_DIR) -Isrc -I. $< $(LDFLAGS) -o $@
+
+$(BUILD_DIR)/test_router_ctl: tests/test_router_ctl.c src/router_ctl.c include/router_common.h $(BUILD_DIR)/local_router.skel.h | $(BUILD_DIR)
+	$(GCC) -O2 -Iinclude -I$(BUILD_DIR) -Isrc -I. $< $(LDFLAGS) -o $@
+
+test: $(BUILD_DIR)/test_router_ctl
+	./$(BUILD_DIR)/test_router_ctl
 
 clean:
 	rm -rf $(BUILD_DIR)
 
-.PHONY: all clean
+.PHONY: all test clean

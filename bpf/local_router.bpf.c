@@ -1,35 +1,7 @@
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
-
-#define SOL_SOCKET 1
-#define SO_MARK 36
-
-#define AF_INET  2
-#define AF_INET6 10
-
-struct wg_endpoint {
-    __u32 ip4;           /* Network byte order */
-    __u32 ip6[4];        /* Network byte order */
-    __u16 port;          /* Network byte order */
-    __u8  family;        /* AF_INET or AF_INET6 */
-    __u8  enabled;       /* 1 = enabled, 0 = disabled */
-};
-
-struct ipv4_lpm_key {
-    __u32 prefixlen;
-    __u32 data;          /* Network byte order */
-};
-
-struct ipv6_lpm_key {
-    __u32 prefixlen;
-    __u32 data[4];       /* Network byte order */
-};
-
-struct router_config {
-    __u32 fwmark;
-    __u32 enabled;
-};
+#include "router_common.h"
 
 /* Maps */
 struct {
@@ -134,7 +106,7 @@ static __always_inline bool should_bypass_v6(struct bpf_sock_addr *ctx) {
     /* Check LPM Trie */
     struct ipv6_lpm_key key = {
         .prefixlen = 128,
-        .data = { ip0, ip1, ip2, ip3 },
+        .data32 = { ip0, ip1, ip2, ip3 },
     };
     if (bpf_map_lookup_elem(&bypass_v6_map, &key))
         return true;
