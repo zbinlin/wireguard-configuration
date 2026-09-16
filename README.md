@@ -13,6 +13,9 @@
 - **兼容 nftables 规则语法**：原生解析 `var.nft` 格式规则文件，支持 `define FWMARK`、`define IPV4_ELEMENTS`、`define IPV6_ELEMENTS`。
 - **原生支持 IP Range 范围分解**：C 语言位运算内置 Range 分解算法，自动将 `1.0.1.0-1.0.3.255` 等范围转换为最精简的不重叠 CIDR 并写入内核 `LPM_TRIE`。
 - **动态防路由死锁（Anti-Loopback）**：针对 WireGuard 服务端 Endpoint（IP:Port）进行精准识别并强制直连放行，支持命令行热修改。
+- **双模全覆盖（本机 + 局域网透明网关）**：
+  - **本机流量**：基于 `cgroup/connect` + `sendmsg` 提前绑定 `wg0` 源 IP，彻底免去本地 Masquerade。
+  - **转发流量**：支持挂载 eBPF **TC Ingress** 钩子至局域网网卡（支持多网卡绑定），在内核路由查表前提前打标，使局域网转发流量同样享用底层的统一 LPM 白名单。
 - **零停机热更新**：支持实时更新规则或 Endpoint，秒级热写入内核 Map，无需重新挂载或重启 eBPF 程序。
 
 ---
@@ -21,15 +24,19 @@
 
 ```text
 ├── bpf/
-│   └── local_router.bpf.c    # eBPF 内核态源码 (cgroup/connect{4,6}, sendmsg{4,6})
+│   └── local_router.bpf.c    # eBPF 内核态源码 (cgroup/connect{4,6}, sendmsg{4,6}, tc_router_ingress)
+├── include/
+│   └── router_common.h       # 内核态与用户态共享类型与常量头文件
 ├── src/
-│   └── router_ctl.c          # 纯 C 用户态控制器源码 (解析 nft、操作 BPF Map)
+│   └── router_ctl.c          # 纯 C 用户态控制器源码 (解析 nft、操作 BPF Map、管理 cgroup/TC)
+├── tests/
+│   └── test_router_ctl.c     # 完整单元测试套件
 ├── build/                    # 编译产物输出目录 (由 Makefile 统一生成)
 │   ├── vmlinux.h             # 由 bpftool 自动生成的内核 BTF 头文件
 │   ├── local_router.bpf.o    # BPF 目标文件
 │   ├── local_router.skel.h   # bpftool 自动生成的 BPF Skeleton 头文件
 │   └── router_ctl            # 最终生成的控制器二进制文件
-├── Makefile                  # 构建脚本
+├── Makefile                  # 构建与测试脚本
 ├── router-ctl.sh             # Shell 启动与管理脚本
 └── var.nft                   # nftables 格式分流规则文件
 ```
@@ -72,6 +79,7 @@ make
 
 ### 3. 启动并加载规则
 
+#### 仅本机分流（默认模式）：
 ```bash
 sudo ./router-ctl.sh start \
     --cgroup-path /sys/fs/cgroup \
@@ -79,9 +87,25 @@ sudo ./router-ctl.sh start \
     --rule-file var.nft
 ```
 
+#### 本机 + 局域网透明网关分流（支持多网卡 TC Ingress）：
+```bash
+sudo ./router-ctl.sh start \
+    --cgroup-path /sys/fs/cgroup \
+    --wg-endpoint 198.51.100.1:51820 \
+    --rule-file var.nft \
+    --lan-if eth1,eth2    # 支持逗号分隔或多次使用 --lan-if
+```
+
+> [!TIP]
+> 当作为局域网网关转发时，请确保开启了内核转发：
+> `sudo sysctl -w net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1`
+> 并在 nftables 中仅为转发流量添加一条 Masquerade（本机流量依然零 SNAT）：
+> `nft add rule inet nat postrouting oifname "wg*" masquerade`
+
 参数说明：
 - `--cgroup-path <path>`：cgroup v2 挂载路径（默认 `/sys/fs/cgroup`）。
 - `--pin-dir <path>`：（可选）BPF 对象持久化 Pin 目录（默认 `/sys/fs/bpf/wg_routing`）。
+- `--lan-if <iface>`：（可选）绑定局域网网卡启用 TC Ingress 分流，支持重复或逗号分隔（如 `eth1,eth2` 或 `eth1`）。
 - `--wg-endpoint <IP[:Port]>`：WireGuard 服务端地址（防死锁回环）。
   - 支持带端口：如 `198.51.100.1:51820` 或 `[2001:db8::1]:51820`（仅匹配指定端口）。
   - **支持不带端口**：如 `198.51.100.1` 或 `2001:db8::1`（匹配该 IP 的所有端口全部放行直连）。
@@ -98,6 +122,7 @@ sudo ./router-ctl.sh status
 ```text
 [+] eBPF Router Status:
   Pinned Directory: /sys/fs/bpf/wg_routing
+  LAN Interfaces (TC Ingress): eth1, eth2 (Forwarding bypass active)
   Enabled: true, FWMARK: 0x3000 (12288)
   WireGuard Endpoint: 198.51.100.1:51820
   Bypass IPv4 CIDRs in kernel map: 18

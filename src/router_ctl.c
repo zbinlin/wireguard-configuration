@@ -11,10 +11,16 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <arpa/inet.h>
+#include <net/if.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include "router_common.h"
 #include "local_router.skel.h"
+
+struct lan_ifaces {
+    char names[MAX_LAN_IFACES][IFNAMSIZ];
+    int count;
+};
 
 static char *trim(char *str) {
     while (isspace((unsigned char)*str)) str++;
@@ -23,6 +29,125 @@ static char *trim(char *str) {
     while (end > str && isspace((unsigned char)*end)) end--;
     end[1] = '\0';
     return str;
+}
+
+static void add_lan_iface(struct lan_ifaces *list, const char *arg) {
+    if (!arg || !list) return;
+    char buf[256];
+    strncpy(buf, arg, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    char *saveptr = NULL;
+    char *tok = strtok_r(buf, " ,\t", &saveptr);
+    while (tok) {
+        char *name = trim(tok);
+        if (*name) {
+            bool exists = false;
+            for (int i = 0; i < list->count; i++) {
+                if (strcmp(list->names[i], name) == 0) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists && list->count < MAX_LAN_IFACES) {
+                strncpy(list->names[list->count], name, IFNAMSIZ - 1);
+                list->names[list->count][IFNAMSIZ - 1] = '\0';
+                list->count++;
+            }
+        }
+        tok = strtok_r(NULL, " ,\t", &saveptr);
+    }
+}
+
+static void save_lan_ifaces(const char *pin_dir, const struct lan_ifaces *list) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", pin_dir, LAN_IFACES_FILENAME);
+    if (!list || list->count == 0) {
+        unlink(path);
+        return;
+    }
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    for (int i = 0; i < list->count; i++) {
+        fprintf(f, "%s\n", list->names[i]);
+    }
+    fclose(f);
+}
+
+static void load_lan_ifaces(const char *pin_dir, struct lan_ifaces *list) {
+    list->count = 0;
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", pin_dir, LAN_IFACES_FILENAME);
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+        char *t = trim(line);
+        if (*t && list->count < MAX_LAN_IFACES) {
+            strncpy(list->names[list->count], t, IFNAMSIZ - 1);
+            list->names[list->count][IFNAMSIZ - 1] = '\0';
+            list->count++;
+        }
+    }
+    fclose(f);
+}
+
+static int tc_attach_interface(int prog_fd, const char *ifname) {
+    unsigned int ifindex = if_nametoindex(ifname);
+    if (ifindex == 0) {
+        fprintf(stderr, "Error: Network interface '%s' not found: %s\n", ifname, strerror(errno));
+        return -1;
+    }
+
+    /* 1. Create clsact qdisc/hook on the interface */
+    struct bpf_tc_hook hook = {
+        .sz = sizeof(hook),
+        .ifindex = (int)ifindex,
+        .attach_point = BPF_TC_INGRESS,
+    };
+    int err = bpf_tc_hook_create(&hook);
+    if (err && err != -EEXIST) {
+        fprintf(stderr, "Error: Failed to create TC clsact hook on %s: %d (%s)\n",
+                ifname, err, strerror(-err));
+        return -1;
+    }
+
+    /* 2. Attach TC ingress filter */
+    struct bpf_tc_opts opts = {
+        .sz = sizeof(opts),
+        .prog_fd = prog_fd,
+        .flags = BPF_TC_F_REPLACE,
+    };
+    err = bpf_tc_attach(&hook, &opts);
+    if (err) {
+        fprintf(stderr, "Error: Failed to attach TC ingress filter to %s: %d (%s)\n",
+                ifname, err, strerror(-err));
+        return -1;
+    }
+
+    printf("[+] Successfully attached TC ingress filter to '%s' (idx %u)!\n", ifname, ifindex);
+    return 0;
+}
+
+static int tc_detach_interface(const char *ifname) {
+    unsigned int ifindex = if_nametoindex(ifname);
+    if (ifindex == 0) {
+        return 0;
+    }
+
+    struct bpf_tc_hook hook = {
+        .sz = sizeof(hook),
+        .ifindex = (int)ifindex,
+        .attach_point = BPF_TC_INGRESS,
+    };
+    int err = bpf_tc_hook_destroy(&hook);
+    if (err && err != -ENOENT) {
+        struct bpf_tc_opts opts = {
+            .sz = sizeof(opts),
+            .prog_id = 0,
+        };
+        bpf_tc_detach(&hook, &opts);
+    }
+    return 0;
 }
 
 static int ensure_dir(const char *path) {
@@ -512,9 +637,26 @@ static int parse_rule_file(const char *rule_file, struct rule_collector *rc) {
     return 0;
 }
 
-static int do_stop(const char *pin_dir) {
+static int do_stop(const char *pin_dir, const struct lan_ifaces *cli_lan_ifaces) {
     if (!pin_dir) pin_dir = DEFAULT_PIN_DIR;
     printf("[*] Stopping eBPF router and cleaning up pinned objects at %s...\n", pin_dir);
+
+    /* 1. Detach TC ingress from all LAN interfaces (both saved and CLI specified) */
+    struct lan_ifaces saved_list = {0};
+    load_lan_ifaces(pin_dir, &saved_list);
+    for (int i = 0; i < saved_list.count; i++) {
+        tc_detach_interface(saved_list.names[i]);
+    }
+    if (cli_lan_ifaces) {
+        for (int i = 0; i < cli_lan_ifaces->count; i++) {
+            tc_detach_interface(cli_lan_ifaces->names[i]);
+        }
+    }
+    char lan_path[512];
+    snprintf(lan_path, sizeof(lan_path), "%s/%s", pin_dir, LAN_IFACES_FILENAME);
+    unlink(lan_path);
+
+    /* 2. Unpin cgroup links and maps */
     remove_pinned(pin_dir, "link_connect4");
     remove_pinned(pin_dir, "link_sendmsg4");
     remove_pinned(pin_dir, "link_connect6");
@@ -633,7 +775,7 @@ static int apply_nft_rules(const char *rule_file, const char *wg_endpoint_str, c
     return 0;
 }
 
-static int do_start(const char *cgroup_path, const char *rule_file, const char *wg_endpoint, const char *fwmark, const char *pin_dir) {
+static int do_start(const char *cgroup_path, const char *rule_file, const char *wg_endpoint, const char *fwmark, const char *pin_dir, const struct lan_ifaces *lan_list) {
     if (!rule_file) {
         fprintf(stderr, "Error: --rule-file is required for start.\n");
         return 1;
@@ -656,14 +798,7 @@ static int do_start(const char *cgroup_path, const char *rule_file, const char *
     }
 
     /* Clean up any leftover pinned objects from previous runs */
-    remove_pinned(pin_dir, "link_connect4");
-    remove_pinned(pin_dir, "link_sendmsg4");
-    remove_pinned(pin_dir, "link_connect6");
-    remove_pinned(pin_dir, "link_sendmsg6");
-    remove_pinned(pin_dir, "wg_endpoint_map");
-    remove_pinned(pin_dir, "bypass_v4_map");
-    remove_pinned(pin_dir, "bypass_v6_map");
-    remove_pinned(pin_dir, "router_config_map");
+    do_stop(pin_dir, lan_list);
 
     /* Also clean up any accidental root bpffs pins from earlier versions */
     unlink("/sys/fs/bpf/wg_endpoint_map");
@@ -747,6 +882,21 @@ static int do_start(const char *cgroup_path, const char *rule_file, const char *
 
     printf("[+] Successfully loaded and attached eBPF programs to cgroup '%s'!\n", cgroup_path);
 
+    /* Attach TC ingress on specified LAN interfaces */
+    int tc_attached_count = 0;
+    if (lan_list && lan_list->count > 0) {
+        int tc_prog_fd = bpf_program__fd(skel->progs.tc_router_ingress);
+        for (int i = 0; i < lan_list->count; i++) {
+            if (tc_attach_interface(tc_prog_fd, lan_list->names[i]) != 0) {
+                err = -1;
+                goto cleanup_rollback;
+            }
+            tc_attached_count++;
+        }
+        save_lan_ifaces(pin_dir, lan_list);
+        printf("[+] Attached TC ingress filter to %d LAN interface(s) for forwarded traffic!\n", tc_attached_count);
+    }
+
     /* Apply rules */
     err = apply_nft_rules(rule_file, wg_endpoint, fwmark, pin_dir);
     if (err) {
@@ -760,7 +910,7 @@ static int do_start(const char *cgroup_path, const char *rule_file, const char *
 
 cleanup_rollback:
     fprintf(stderr, "[!] Start failed; rolling back and cleaning up pinned objects at %s...\n", pin_dir);
-    do_stop(pin_dir);
+    do_stop(pin_dir, lan_list);
     close(cgroup_fd);
     local_router_bpf__destroy(skel);
     return 1;
@@ -802,6 +952,19 @@ static int do_status(const char *pin_dir) {
 
     printf("[+] eBPF Router Status:\n");
     printf("  Pinned Directory: %s\n", pin_dir);
+
+    /* Show attached LAN interfaces */
+    struct lan_ifaces lan_list = {0};
+    load_lan_ifaces(pin_dir, &lan_list);
+    if (lan_list.count > 0) {
+        printf("  LAN Interfaces (TC Ingress): ");
+        for (int i = 0; i < lan_list.count; i++) {
+            printf("%s%s", lan_list.names[i], (i + 1 < lan_list.count) ? ", " : "");
+        }
+        printf(" (Forwarding bypass active)\n");
+    } else {
+        printf("  LAN Interfaces (TC Ingress): None (Local-only mode)\n");
+    }
 
     char path[512];
     snprintf(path, sizeof(path), "%s/router_config_map", pin_dir);
@@ -867,14 +1030,17 @@ static int do_status(const char *pin_dir) {
 static void print_usage(const char *prog) {
     printf("Usage: %s <start|stop|reload|set-endpoint|status> [options]\n\n", prog);
     printf("Commands:\n");
-    printf("  start          Load eBPF, attach to cgroup, and apply nftables rules\n");
+    printf("  start          Load eBPF, attach to cgroup and optional LAN interfaces, and apply rules\n");
     printf("                 Options: --cgroup-path <path>    (default: /sys/fs/cgroup)\n");
     printf("                          --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n");
     printf("                          --wg-endpoint <IP[:Port]>\n");
     printf("                          --rule-file <var.nft>   (required)\n");
-    printf("                          --fwmark <mark>         (optional override)\n\n");
-    printf("  stop           Detach eBPF programs and remove pinned objects\n");
-    printf("                 Options: --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n\n");
+    printf("                          --fwmark <mark>         (optional override)\n");
+    printf("                          --lan-if <iface>        (optional LAN interfaces for TC ingress,\n");
+    printf("                                                   can be repeated or comma-separated, e.g. eth1,eth2)\n\n");
+    printf("  stop           Detach eBPF programs, TC ingress filters, and remove pinned objects\n");
+    printf("                 Options: --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n");
+    printf("                          --lan-if <iface>        (optional explicit LAN interfaces to detach)\n\n");
     printf("  reload         Hot-reload nftables rule file into BPF maps (no detach)\n");
     printf("                 Options: --rule-file <var.nft>   (required)\n");
     printf("                          --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n");
@@ -883,7 +1049,7 @@ static void print_usage(const char *prog) {
     printf("  set-endpoint   Dynamically update WireGuard endpoint (IP[:Port])\n");
     printf("                 Options: --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n");
     printf("                 Usage:   %s set-endpoint <IP[:Port]> [--pin-dir <path>]\n\n", prog);
-    printf("  status         Show current eBPF router status and map statistics\n");
+    printf("  status         Show current eBPF router status, LAN interfaces, and map statistics\n");
     printf("                 Options: --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n");
 }
 
@@ -902,6 +1068,7 @@ int main(int argc, char **argv) {
         const char *rule_file = NULL;
         const char *wg_endpoint = NULL;
         const char *fwmark = NULL;
+        struct lan_ifaces lan_list = {0};
 
         for (int i = 2; i < argc; i++) {
             if (strcmp(argv[i], "--cgroup-path") == 0 && i + 1 < argc) {
@@ -914,24 +1081,31 @@ int main(int argc, char **argv) {
                 wg_endpoint = argv[++i];
             } else if (strcmp(argv[i], "--fwmark") == 0 && i + 1 < argc) {
                 fwmark = argv[++i];
+            } else if ((strcmp(argv[i], "--lan-if") == 0 || strcmp(argv[i], "--forward-if") == 0 ||
+                        strcmp(argv[i], "--lan-interface") == 0) && i + 1 < argc) {
+                add_lan_iface(&lan_list, argv[++i]);
             } else {
                 fprintf(stderr, "Unknown argument '%s'\n", argv[i]);
                 print_usage(argv[0]);
                 return 1;
             }
         }
-        return do_start(cgroup_path, rule_file, wg_endpoint, fwmark, pin_dir);
+        return do_start(cgroup_path, rule_file, wg_endpoint, fwmark, pin_dir, &lan_list);
     } else if (strcmp(cmd, "stop") == 0 || strcmp(cmd, "unload") == 0) {
+        struct lan_ifaces cli_lan = {0};
         for (int i = 2; i < argc; i++) {
             if (strcmp(argv[i], "--pin-dir") == 0 && i + 1 < argc) {
                 pin_dir = argv[++i];
+            } else if ((strcmp(argv[i], "--lan-if") == 0 || strcmp(argv[i], "--forward-if") == 0 ||
+                        strcmp(argv[i], "--lan-interface") == 0) && i + 1 < argc) {
+                add_lan_iface(&cli_lan, argv[++i]);
             } else {
                 fprintf(stderr, "Unknown argument '%s'\n", argv[i]);
                 print_usage(argv[0]);
                 return 1;
             }
         }
-        return do_stop(pin_dir);
+        return do_stop(pin_dir, &cli_lan);
     } else if (strcmp(cmd, "reload") == 0 || strcmp(cmd, "apply") == 0) {
         const char *rule_file = NULL;
         const char *wg_endpoint = NULL;
