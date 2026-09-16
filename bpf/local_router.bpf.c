@@ -23,7 +23,7 @@ struct ipv4_lpm_key {
 
 struct ipv6_lpm_key {
     __u32 prefixlen;
-    __u8  data[16];      /* Network byte order */
+    __u32 data[4];       /* Network byte order */
 };
 
 struct router_config {
@@ -75,8 +75,11 @@ static __always_inline void apply_mark(struct bpf_sock_addr *ctx) {
     bpf_setsockopt(ctx, SOL_SOCKET, SO_MARK, &mark, sizeof(mark));
 }
 
-static __always_inline bool should_bypass_v4(__u32 user_ip4, __u32 user_port) {
+static __always_inline bool should_bypass_v4(struct bpf_sock_addr *ctx) {
+    __u32 user_ip4 = ctx->user_ip4;
+    __u32 user_port = ctx->user_port;
     __u32 ip = bpf_ntohl(user_ip4);
+
     /* Bypass Loopback (127.0.0.0/8) */
     if ((ip >> 24) == 127) return true;
     /* Bypass Multicast (224.0.0.0/4) & Broadcast */
@@ -101,35 +104,42 @@ static __always_inline bool should_bypass_v4(__u32 user_ip4, __u32 user_port) {
     return false;
 }
 
-static __always_inline bool should_bypass_v6(const __u32 *user_ip6, __u32 user_port) {
+static __always_inline bool should_bypass_v6(struct bpf_sock_addr *ctx) {
+    __u32 ip0 = ctx->user_ip6[0];
+    __u32 ip1 = ctx->user_ip6[1];
+    __u32 ip2 = ctx->user_ip6[2];
+    __u32 ip3 = ctx->user_ip6[3];
+    __u32 user_port = ctx->user_port;
+
     /* Bypass Loopback (::1) */
-    if (user_ip6[0] == 0 && user_ip6[1] == 0 &&
-        user_ip6[2] == 0 && user_ip6[3] == bpf_htonl(1))
+    if (ip0 == 0 && ip1 == 0 && ip2 == 0 && ip3 == bpf_htonl(1))
         return true;
 
     /* Bypass Link-local (fe80::/10) */
-    if ((bpf_ntohl(user_ip6[0]) & 0xffc00000) == 0xfe800000)
+    if ((bpf_ntohl(ip0) & 0xffc00000) == 0xfe800000)
         return true;
 
     /* Bypass Multicast (ff00::/8) */
-    if ((bpf_ntohl(user_ip6[0]) & 0xff000000) == 0xff000000)
+    if ((bpf_ntohl(ip0) & 0xff000000) == 0xff000000)
         return true;
 
     /* Check WireGuard Endpoint */
     __u32 zero = 0;
     struct wg_endpoint *ep = bpf_map_lookup_elem(&wg_endpoint_map, &zero);
     if (ep && ep->enabled && ep->family == AF_INET6) {
-        if (user_ip6[0] == ep->ip6[0] &&
-            user_ip6[1] == ep->ip6[1] &&
-            user_ip6[2] == ep->ip6[2] &&
-            user_ip6[3] == ep->ip6[3] &&
+        if (ip0 == ep->ip6[0] &&
+            ip1 == ep->ip6[1] &&
+            ip2 == ep->ip6[2] &&
+            ip3 == ep->ip6[3] &&
             (ep->port == 0 || (__u16)user_port == ep->port))
             return true;
     }
 
     /* Check LPM Trie */
-    struct ipv6_lpm_key key = { .prefixlen = 128 };
-    __builtin_memcpy(key.data, user_ip6, 16);
+    struct ipv6_lpm_key key = {
+        .prefixlen = 128,
+        .data = { ip0, ip1, ip2, ip3 },
+    };
     if (bpf_map_lookup_elem(&bypass_v6_map, &key))
         return true;
 
@@ -138,7 +148,7 @@ static __always_inline bool should_bypass_v6(const __u32 *user_ip6, __u32 user_p
 
 SEC("cgroup/connect4")
 int sock_connect4(struct bpf_sock_addr *ctx) {
-    if (should_bypass_v4(ctx->user_ip4, ctx->user_port))
+    if (should_bypass_v4(ctx))
         return 1;
     apply_mark(ctx);
     return 1;
@@ -146,7 +156,7 @@ int sock_connect4(struct bpf_sock_addr *ctx) {
 
 SEC("cgroup/sendmsg4")
 int sock_sendmsg4(struct bpf_sock_addr *ctx) {
-    if (should_bypass_v4(ctx->user_ip4, ctx->user_port))
+    if (should_bypass_v4(ctx))
         return 1;
     apply_mark(ctx);
     return 1;
@@ -154,7 +164,7 @@ int sock_sendmsg4(struct bpf_sock_addr *ctx) {
 
 SEC("cgroup/connect6")
 int sock_connect6(struct bpf_sock_addr *ctx) {
-    if (should_bypass_v6(ctx->user_ip6, ctx->user_port))
+    if (should_bypass_v6(ctx))
         return 1;
     apply_mark(ctx);
     return 1;
@@ -162,7 +172,7 @@ int sock_connect6(struct bpf_sock_addr *ctx) {
 
 SEC("cgroup/sendmsg6")
 int sock_sendmsg6(struct bpf_sock_addr *ctx) {
-    if (should_bypass_v6(ctx->user_ip6, ctx->user_port))
+    if (should_bypass_v6(ctx))
         return 1;
     apply_mark(ctx);
     return 1;
