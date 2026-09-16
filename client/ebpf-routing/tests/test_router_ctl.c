@@ -255,6 +255,8 @@ static void test_lan_ifaces(void) {
     char path[512];
     snprintf(path, sizeof(path), "%s/%s", test_dir, LAN_IFACES_FILENAME);
     unlink(path);
+    snprintf(path, sizeof(path), "%s/%s.txt", test_dir, LAN_IFACES_FILENAME);
+    unlink(path);
     rmdir(test_dir);
 
     printf("  [PASS] test_lan_ifaces\n");
