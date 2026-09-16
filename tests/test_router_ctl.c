@@ -235,6 +235,23 @@ static void test_lan_ifaces(void) {
     assert(strcmp(loaded.names[2], "br0") == 0);
     assert(strcmp(loaded.names[3], "eth3") == 0);
 
+    /* 5. Removal of interfaces */
+    remove_lan_iface(&list, "eth2");
+    assert(list.count == 3);
+    assert(strcmp(list.names[0], "eth1") == 0);
+    assert(strcmp(list.names[1], "br0") == 0);
+    assert(strcmp(list.names[2], "eth3") == 0);
+
+    remove_lan_iface(&list, "eth1, eth3");
+    assert(list.count == 1);
+    assert(strcmp(list.names[0], "br0") == 0);
+
+    remove_lan_iface(&list, "nonexistent");
+    assert(list.count == 1);
+
+    remove_lan_iface(&list, "br0");
+    assert(list.count == 0);
+
     char path[512];
     snprintf(path, sizeof(path), "%s/%s", test_dir, LAN_IFACES_FILENAME);
     unlink(path);

@@ -50,6 +50,7 @@
 #endif
 
 #define LAN_IFACES_FILENAME "lan_ifaces"
+#define TC_PROG_FILENAME "prog_tc_ingress"
 #define MAX_LAN_IFACES 32
 
 struct wg_endpoint {

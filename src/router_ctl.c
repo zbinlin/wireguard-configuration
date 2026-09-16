@@ -58,6 +58,30 @@ static void add_lan_iface(struct lan_ifaces *list, const char *arg) {
     }
 }
 
+static void remove_lan_iface(struct lan_ifaces *list, const char *arg) {
+    if (!arg || !list) return;
+    char buf[256];
+    strncpy(buf, arg, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    char *saveptr = NULL;
+    char *tok = strtok_r(buf, " ,\t", &saveptr);
+    while (tok) {
+        char *name = trim(tok);
+        if (*name) {
+            for (int i = 0; i < list->count; i++) {
+                if (strcmp(list->names[i], name) == 0) {
+                    for (int j = i; j < list->count - 1; j++) {
+                        memcpy(list->names[j], list->names[j + 1], IFNAMSIZ);
+                    }
+                    list->count--;
+                    i--;
+                }
+            }
+        }
+        tok = strtok_r(NULL, " ,\t", &saveptr);
+    }
+}
+
 static void save_lan_ifaces(const char *pin_dir, const struct lan_ifaces *list) {
     char path[512];
     snprintf(path, sizeof(path), "%s/%s", pin_dir, LAN_IFACES_FILENAME);
@@ -148,6 +172,23 @@ static int tc_detach_interface(const char *ifname) {
         bpf_tc_detach(&hook, &opts);
     }
     return 0;
+}
+
+static bool is_tc_ingress_attached(const char *ifname) {
+    unsigned int ifindex = if_nametoindex(ifname);
+    if (ifindex == 0) {
+        return false;
+    }
+
+    struct bpf_tc_hook hook = {
+        .sz = sizeof(hook),
+        .ifindex = (int)ifindex,
+        .attach_point = BPF_TC_INGRESS,
+    };
+    struct bpf_tc_opts opts = {
+        .sz = sizeof(opts),
+    };
+    return bpf_tc_query(&hook, &opts) == 0;
 }
 
 static int ensure_dir(const char *path) {
@@ -656,7 +697,10 @@ static int do_stop(const char *pin_dir, const struct lan_ifaces *cli_lan_ifaces)
     snprintf(lan_path, sizeof(lan_path), "%s/%s", pin_dir, LAN_IFACES_FILENAME);
     unlink(lan_path);
 
-    /* 2. Unpin cgroup links and maps */
+    /* 2. Unpin TC ingress program */
+    remove_pinned(pin_dir, TC_PROG_FILENAME);
+
+    /* 3. Unpin cgroup links and maps */
     remove_pinned(pin_dir, "link_connect4");
     remove_pinned(pin_dir, "link_sendmsg4");
     remove_pinned(pin_dir, "link_connect6");
@@ -797,7 +841,7 @@ static int do_start(const char *cgroup_path, const char *rule_file, const char *
         return 1;
     }
 
-    /* Clean up any leftover pinned objects from previous runs */
+    /* Clean up any leftover pinned objects and TC filters from previous runs */
     do_stop(pin_dir, lan_list);
 
     /* Also clean up any accidental root bpffs pins from earlier versions */
@@ -824,6 +868,16 @@ static int do_start(const char *cgroup_path, const char *rule_file, const char *
     err = bpf_object__pin_maps(skel->obj, pin_dir);
     if (err && err != -EEXIST) {
         fprintf(stderr, "Error: Failed to pin maps: %d\n", err);
+        goto cleanup_rollback;
+    }
+
+    /* Pin TC ingress program to allow dynamic add-if / del-if later */
+    char prog_path[512];
+    snprintf(prog_path, sizeof(prog_path), "%s/%s", pin_dir, TC_PROG_FILENAME);
+    unlink(prog_path);
+    err = bpf_program__pin(skel->progs.tc_router_ingress, prog_path);
+    if (err && err != -EEXIST) {
+        fprintf(stderr, "Error: Failed to pin TC ingress program: %d\n", err);
         goto cleanup_rollback;
     }
 
@@ -916,6 +970,72 @@ cleanup_rollback:
     return 1;
 }
 
+static int do_add_if(const char *if_str, const char *pin_dir) {
+    if (!pin_dir) pin_dir = DEFAULT_PIN_DIR;
+    char prog_path[512];
+    snprintf(prog_path, sizeof(prog_path), "%s/%s", pin_dir, TC_PROG_FILENAME);
+    int prog_fd = bpf_obj_get(prog_path);
+    if (prog_fd < 0) {
+        fprintf(stderr, "Error: Router is not running or TC ingress program not found at %s. Is the router loaded?\n",
+                prog_path);
+        return 1;
+    }
+
+    struct lan_ifaces cur_list = {0};
+    load_lan_ifaces(pin_dir, &cur_list);
+
+    struct lan_ifaces to_add = {0};
+    add_lan_iface(&to_add, if_str);
+
+    if (to_add.count == 0) {
+        fprintf(stderr, "Error: No valid interface names specified.\n");
+        close(prog_fd);
+        return 1;
+    }
+
+    int success_count = 0;
+    for (int i = 0; i < to_add.count; i++) {
+        if (tc_attach_interface(prog_fd, to_add.names[i]) == 0) {
+            add_lan_iface(&cur_list, to_add.names[i]);
+            success_count++;
+        }
+    }
+
+    close(prog_fd);
+    save_lan_ifaces(pin_dir, &cur_list);
+
+    if (success_count > 0) {
+        printf("[✔] Successfully attached TC filter to and saved %d LAN interface(s)!\n", success_count);
+        return 0;
+    }
+    return 1;
+}
+
+static int do_del_if(const char *if_str, const char *pin_dir) {
+    if (!pin_dir) pin_dir = DEFAULT_PIN_DIR;
+
+    struct lan_ifaces cur_list = {0};
+    load_lan_ifaces(pin_dir, &cur_list);
+
+    struct lan_ifaces to_del = {0};
+    add_lan_iface(&to_del, if_str);
+
+    if (to_del.count == 0) {
+        fprintf(stderr, "Error: No valid interface names specified.\n");
+        return 1;
+    }
+
+    for (int i = 0; i < to_del.count; i++) {
+        tc_detach_interface(to_del.names[i]);
+        remove_lan_iface(&cur_list, to_del.names[i]);
+        printf("[-] Detached TC ingress filter from '%s'\n", to_del.names[i]);
+    }
+
+    save_lan_ifaces(pin_dir, &cur_list);
+    printf("[✔] Successfully detached and removed %d LAN interface(s)!\n", to_del.count);
+    return 0;
+}
+
 static int do_set_endpoint(const char *endpoint_str, const char *pin_dir) {
     if (!pin_dir) pin_dir = DEFAULT_PIN_DIR;
 
@@ -953,15 +1073,23 @@ static int do_status(const char *pin_dir) {
     printf("[+] eBPF Router Status:\n");
     printf("  Pinned Directory: %s\n", pin_dir);
 
-    /* Show attached LAN interfaces */
+    /* Show attached LAN interfaces and their live kernel state */
     struct lan_ifaces lan_list = {0};
     load_lan_ifaces(pin_dir, &lan_list);
     if (lan_list.count > 0) {
-        printf("  LAN Interfaces (TC Ingress): ");
+        printf("  LAN Interfaces (TC Ingress Forwarding):\n");
         for (int i = 0; i < lan_list.count; i++) {
-            printf("%s%s", lan_list.names[i], (i + 1 < lan_list.count) ? ", " : "");
+            const char *name = lan_list.names[i];
+            unsigned int ifidx = if_nametoindex(name);
+            if (ifidx == 0) {
+                printf("    - %-12s: [MISSING / DOWN] (Device not present in system)\n", name);
+            } else if (is_tc_ingress_attached(name)) {
+                printf("    - %-12s: [ACTIVE] (ifindex %u, TC ingress filter active)\n", name, ifidx);
+            } else {
+                printf("    - %-12s: [DETACHED / RECREATED] (ifindex %u, filter missing - run 'add-if %s' to reattach)\n",
+                       name, ifidx, name);
+            }
         }
-        printf(" (Forwarding bypass active)\n");
     } else {
         printf("  LAN Interfaces (TC Ingress): None (Local-only mode)\n");
     }
@@ -1028,7 +1156,7 @@ static int do_status(const char *pin_dir) {
 }
 
 static void print_usage(const char *prog) {
-    printf("Usage: %s <start|stop|reload|set-endpoint|status> [options]\n\n", prog);
+    printf("Usage: %s <start|stop|reload|set-endpoint|add-if|del-if|status> [options]\n\n", prog);
     printf("Commands:\n");
     printf("  start          Load eBPF, attach to cgroup and optional LAN interfaces, and apply rules\n");
     printf("                 Options: --cgroup-path <path>    (default: /sys/fs/cgroup)\n");
@@ -1049,6 +1177,12 @@ static void print_usage(const char *prog) {
     printf("  set-endpoint   Dynamically update WireGuard endpoint (IP[:Port])\n");
     printf("                 Options: --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n");
     printf("                 Usage:   %s set-endpoint <IP[:Port]> [--pin-dir <path>]\n\n", prog);
+    printf("  add-if         Dynamically attach TC ingress filter to LAN interface(s)\n");
+    printf("                 Options: --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n");
+    printf("                 Usage:   %s add-if <iface[,iface2]> [--pin-dir <path>]\n\n", prog);
+    printf("  del-if         Dynamically detach TC ingress filter from LAN interface(s)\n");
+    printf("                 Options: --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n");
+    printf("                 Usage:   %s del-if <iface[,iface2]> [--pin-dir <path>]\n\n", prog);
     printf("  status         Show current eBPF router status, LAN interfaces, and map statistics\n");
     printf("                 Options: --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n");
 }
@@ -1149,6 +1283,42 @@ int main(int argc, char **argv) {
             return 1;
         }
         return do_set_endpoint(ep_str, pin_dir);
+    } else if (strcmp(cmd, "add-if") == 0 || strcmp(cmd, "add-lan-if") == 0) {
+        const char *if_str = NULL;
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--pin-dir") == 0 && i + 1 < argc) {
+                pin_dir = argv[++i];
+            } else if (!if_str && argv[i][0] != '-') {
+                if_str = argv[i];
+            } else {
+                fprintf(stderr, "Unknown argument '%s'\n", argv[i]);
+                print_usage(argv[0]);
+                return 1;
+            }
+        }
+        if (!if_str) {
+            fprintf(stderr, "Error: missing interface argument. Usage: %s add-if <iface[,iface2]> [--pin-dir <path>]\n", argv[0]);
+            return 1;
+        }
+        return do_add_if(if_str, pin_dir);
+    } else if (strcmp(cmd, "del-if") == 0 || strcmp(cmd, "del-lan-if") == 0 || strcmp(cmd, "remove-if") == 0) {
+        const char *if_str = NULL;
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--pin-dir") == 0 && i + 1 < argc) {
+                pin_dir = argv[++i];
+            } else if (!if_str && argv[i][0] != '-') {
+                if_str = argv[i];
+            } else {
+                fprintf(stderr, "Unknown argument '%s'\n", argv[i]);
+                print_usage(argv[0]);
+                return 1;
+            }
+        }
+        if (!if_str) {
+            fprintf(stderr, "Error: missing interface argument. Usage: %s del-if <iface[,iface2]> [--pin-dir <path>]\n", argv[0]);
+            return 1;
+        }
+        return do_del_if(if_str, pin_dir);
     } else if (strcmp(cmd, "status") == 0) {
         for (int i = 2; i < argc; i++) {
             if (strcmp(argv[i], "--pin-dir") == 0 && i + 1 < argc) {
