@@ -49,7 +49,11 @@
 #define ETH_P_8021AD 0x88A8
 #endif
 
-#define LAN_IFACES_FILENAME "lan_ifaces"
+#ifndef IFNAMSIZ
+#define IFNAMSIZ 16
+#endif
+
+#define LAN_IFACES_FILENAME "lan_ifaces_map"
 #define TC_PROG_FILENAME "prog_tc_ingress"
 #define MAX_LAN_IFACES 32
 

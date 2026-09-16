@@ -102,9 +102,68 @@ static void remove_lan_iface(struct lan_ifaces *list, const char *arg) {
     }
 }
 
-static void save_lan_ifaces(const char *pin_dir, const struct lan_ifaces *list) {
+static int get_or_create_lan_map(const char *pin_dir) {
     char path[512];
     snprintf(path, sizeof(path), "%s/%s", pin_dir, LAN_IFACES_FILENAME);
+    int fd = bpf_obj_get(path);
+    if (fd >= 0) {
+        return fd;
+    }
+    /* Try older name "lan_ifaces" if exists */
+    snprintf(path, sizeof(path), "%s/lan_ifaces", pin_dir);
+    fd = bpf_obj_get(path);
+    if (fd >= 0) {
+        return fd;
+    }
+    /* If not found, create and pin it into bpffs */
+    snprintf(path, sizeof(path), "%s/%s", pin_dir, LAN_IFACES_FILENAME);
+    fd = bpf_map_create(BPF_MAP_TYPE_HASH, LAN_IFACES_FILENAME, IFNAMSIZ, sizeof(__u32), MAX_LAN_IFACES, NULL);
+    if (fd < 0) {
+        return -1;
+    }
+    int pin_err = bpf_obj_pin(fd, path);
+    if (pin_err != 0) {
+        /* If pinning fails (e.g. not a bpffs directory like /tmp in unit tests), fallback */
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static void save_lan_ifaces(const char *pin_dir, const struct lan_ifaces *list) {
+    int map_fd = get_or_create_lan_map(pin_dir);
+    if (map_fd >= 0) {
+        /* Collect all existing keys to delete */
+        char keys_to_delete[MAX_LAN_IFACES][IFNAMSIZ];
+        int del_count = 0;
+        char prev_key[IFNAMSIZ] = {0};
+        char next_key[IFNAMSIZ] = {0};
+        char *lookup_key = NULL;
+        while (bpf_map_get_next_key(map_fd, lookup_key, next_key) == 0 && del_count < MAX_LAN_IFACES) {
+            memcpy(keys_to_delete[del_count++], next_key, IFNAMSIZ);
+            memcpy(prev_key, next_key, IFNAMSIZ);
+            lookup_key = prev_key;
+        }
+        for (int i = 0; i < del_count; i++) {
+            bpf_map_delete_elem(map_fd, keys_to_delete[i]);
+        }
+
+        /* Insert current entries */
+        if (list) {
+            for (int i = 0; i < list->count; i++) {
+                char k[IFNAMSIZ] = {0};
+                strncpy(k, list->names[i], IFNAMSIZ - 1);
+                __u32 ifidx = if_nametoindex(k);
+                bpf_map_update_elem(map_fd, k, &ifidx, BPF_ANY);
+            }
+        }
+        close(map_fd);
+        return;
+    }
+
+    /* Fallback for regular filesystem (e.g. unit tests in /tmp) */
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s.txt", pin_dir, LAN_IFACES_FILENAME);
     if (!list || list->count == 0) {
         unlink(path);
         return;
@@ -121,7 +180,33 @@ static void load_lan_ifaces(const char *pin_dir, struct lan_ifaces *list) {
     list->count = 0;
     char path[512];
     snprintf(path, sizeof(path), "%s/%s", pin_dir, LAN_IFACES_FILENAME);
+    int map_fd = bpf_obj_get(path);
+    if (map_fd < 0) {
+        snprintf(path, sizeof(path), "%s/lan_ifaces", pin_dir);
+        map_fd = bpf_obj_get(path);
+    }
+    if (map_fd >= 0) {
+        char prev_key[IFNAMSIZ] = {0};
+        char next_key[IFNAMSIZ] = {0};
+        char *lookup_key = NULL;
+        while (bpf_map_get_next_key(map_fd, lookup_key, next_key) == 0 && list->count < MAX_LAN_IFACES) {
+            strncpy(list->names[list->count], next_key, IFNAMSIZ - 1);
+            list->names[list->count][IFNAMSIZ - 1] = '\0';
+            list->count++;
+            memcpy(prev_key, next_key, IFNAMSIZ);
+            lookup_key = prev_key;
+        }
+        close(map_fd);
+        return;
+    }
+
+    /* Fallback for regular filesystem */
+    snprintf(path, sizeof(path), "%s/%s.txt", pin_dir, LAN_IFACES_FILENAME);
     FILE *f = fopen(path, "r");
+    if (!f) {
+        snprintf(path, sizeof(path), "%s/lan_ifaces.txt", pin_dir);
+        f = fopen(path, "r");
+    }
     if (!f) return;
     char line[128];
     while (fgets(line, sizeof(line), f)) {
@@ -133,6 +218,24 @@ static void load_lan_ifaces(const char *pin_dir, struct lan_ifaces *list) {
         }
     }
     fclose(f);
+}
+
+static uint32_t get_pinned_tc_prog_id(const char *pin_dir) {
+    if (!pin_dir) return 0;
+    char prog_path[512];
+    snprintf(prog_path, sizeof(prog_path), "%s/%s", pin_dir, TC_PROG_FILENAME);
+    int prog_fd = bpf_obj_get(prog_path);
+    if (prog_fd < 0) {
+        return 0;
+    }
+    struct bpf_prog_info info = {0};
+    __u32 len = sizeof(info);
+    uint32_t prog_id = 0;
+    if (bpf_obj_get_info_by_fd(prog_fd, &info, &len) == 0) {
+        prog_id = info.id;
+    }
+    close(prog_fd);
+    return prog_id;
 }
 
 static int tc_attach_interface(int prog_fd, const char *ifname) {
@@ -183,18 +286,16 @@ static int tc_detach_interface(const char *ifname) {
         .ifindex = (int)ifindex,
         .attach_point = BPF_TC_INGRESS,
     };
-    int err = bpf_tc_hook_destroy(&hook);
-    if (err && err != -ENOENT) {
-        struct bpf_tc_opts opts = {
-            .sz = sizeof(opts),
-            .prog_id = 0,
-        };
-        bpf_tc_detach(&hook, &opts);
-    }
+    struct bpf_tc_opts opts = {
+        .sz = sizeof(opts),
+        .prog_id = 0,
+    };
+    bpf_tc_detach(&hook, &opts);
+    bpf_tc_hook_destroy(&hook);
     return 0;
 }
 
-static bool is_tc_ingress_attached(const char *ifname) {
+static bool is_tc_ingress_attached(const char *ifname, uint32_t expected_prog_id) {
     unsigned int ifindex = if_nametoindex(ifname);
     if (ifindex == 0) {
         return false;
@@ -208,7 +309,14 @@ static bool is_tc_ingress_attached(const char *ifname) {
     struct bpf_tc_opts opts = {
         .sz = sizeof(opts),
     };
-    return bpf_tc_query(&hook, &opts) == 0;
+    if (bpf_tc_query(&hook, &opts) != 0) {
+        return false;
+    }
+
+    if (expected_prog_id > 0) {
+        return opts.prog_id == expected_prog_id;
+    }
+    return true;
 }
 
 static int ensure_dir(const char *path) {
@@ -702,20 +810,35 @@ static int do_stop(const char *pin_dir, const struct lan_ifaces *cli_lan_ifaces)
     if (!pin_dir) pin_dir = DEFAULT_PIN_DIR;
     printf("[*] Stopping eBPF router and cleaning up pinned objects at %s...\n", pin_dir);
 
-    /* 1. Detach TC ingress from all LAN interfaces (both saved and CLI specified) */
-    struct lan_ifaces saved_list = {0};
-    load_lan_ifaces(pin_dir, &saved_list);
-    for (int i = 0; i < saved_list.count; i++) {
-        tc_detach_interface(saved_list.names[i]);
-    }
+    uint32_t our_prog_id = get_pinned_tc_prog_id(pin_dir);
+
+    /* 1. Detach TC ingress from all LAN interfaces (both saved, CLI specified, and live discovered) */
+    struct lan_ifaces to_detach = {0};
+    load_lan_ifaces(pin_dir, &to_detach);
     if (cli_lan_ifaces) {
         for (int i = 0; i < cli_lan_ifaces->count; i++) {
-            tc_detach_interface(cli_lan_ifaces->names[i]);
+            add_lan_iface(&to_detach, cli_lan_ifaces->names[i]);
         }
     }
-    char lan_path[512];
-    snprintf(lan_path, sizeof(lan_path), "%s/%s", pin_dir, LAN_IFACES_FILENAME);
-    unlink(lan_path);
+    struct if_nameindex *if_list = if_nameindex();
+    if (if_list) {
+        for (struct if_nameindex *i = if_list; i->if_index && i->if_name; ++i) {
+            if (is_tc_ingress_attached(i->if_name, our_prog_id)) {
+                add_lan_iface(&to_detach, i->if_name);
+            }
+        }
+        if_freenameindex(if_list);
+    }
+    for (int i = 0; i < to_detach.count; i++) {
+        tc_detach_interface(to_detach.names[i]);
+    }
+    remove_pinned(pin_dir, LAN_IFACES_FILENAME);
+    remove_pinned(pin_dir, "lan_ifaces");
+    char txt_path[512];
+    snprintf(txt_path, sizeof(txt_path), "%s/%s.txt", pin_dir, LAN_IFACES_FILENAME);
+    unlink(txt_path);
+    snprintf(txt_path, sizeof(txt_path), "%s/lan_ifaces.txt", pin_dir);
+    unlink(txt_path);
 
     /* 2. Unpin TC ingress program */
     remove_pinned(pin_dir, TC_PROG_FILENAME);
@@ -1001,8 +1124,21 @@ static int do_add_if(const char *if_str, const char *pin_dir) {
         return 1;
     }
 
+    uint32_t our_prog_id = get_pinned_tc_prog_id(pin_dir);
+
     struct lan_ifaces cur_list = {0};
     load_lan_ifaces(pin_dir, &cur_list);
+
+    /* Also discover any attached interface */
+    struct if_nameindex *if_list = if_nameindex();
+    if (if_list) {
+        for (struct if_nameindex *i = if_list; i->if_index && i->if_name; ++i) {
+            if (is_tc_ingress_attached(i->if_name, our_prog_id)) {
+                add_lan_iface(&cur_list, i->if_name);
+            }
+        }
+        if_freenameindex(if_list);
+    }
 
     struct lan_ifaces to_add = {0};
     add_lan_iface(&to_add, if_str);
@@ -1034,8 +1170,21 @@ static int do_add_if(const char *if_str, const char *pin_dir) {
 static int do_del_if(const char *if_str, const char *pin_dir) {
     if (!pin_dir) pin_dir = DEFAULT_PIN_DIR;
 
+    uint32_t our_prog_id = get_pinned_tc_prog_id(pin_dir);
+
     struct lan_ifaces cur_list = {0};
     load_lan_ifaces(pin_dir, &cur_list);
+
+    /* Also discover any attached interface */
+    struct if_nameindex *if_list = if_nameindex();
+    if (if_list) {
+        for (struct if_nameindex *i = if_list; i->if_index && i->if_name; ++i) {
+            if (is_tc_ingress_attached(i->if_name, our_prog_id)) {
+                add_lan_iface(&cur_list, i->if_name);
+            }
+        }
+        if_freenameindex(if_list);
+    }
 
     struct lan_ifaces to_del = {0};
     add_lan_iface(&to_del, if_str);
@@ -1093,9 +1242,27 @@ static int do_status(const char *pin_dir) {
     printf("[+] eBPF Router Status:\n");
     printf("  Pinned Directory: %s\n", pin_dir);
 
+    uint32_t our_prog_id = get_pinned_tc_prog_id(pin_dir);
+
     /* Show attached LAN interfaces and their live kernel state */
     struct lan_ifaces lan_list = {0};
     load_lan_ifaces(pin_dir, &lan_list);
+
+    /* Auto-discover interfaces on the system that have our TC ingress attached */
+    struct if_nameindex *if_list = if_nameindex();
+    if (if_list) {
+        for (struct if_nameindex *i = if_list; i->if_index && i->if_name; ++i) {
+            if (is_tc_ingress_attached(i->if_name, our_prog_id)) {
+                add_lan_iface(&lan_list, i->if_name);
+            }
+        }
+        if_freenameindex(if_list);
+        /* Sync discover results back into persistent map */
+        if (lan_list.count > 0) {
+            save_lan_ifaces(pin_dir, &lan_list);
+        }
+    }
+
     if (lan_list.count > 0) {
         printf("  LAN Interfaces (TC Ingress Forwarding):\n");
         for (int i = 0; i < lan_list.count; i++) {
@@ -1103,7 +1270,7 @@ static int do_status(const char *pin_dir) {
             unsigned int ifidx = if_nametoindex(name);
             if (ifidx == 0) {
                 printf("    - %-12s: [MISSING / DOWN] (Device not present in system)\n", name);
-            } else if (is_tc_ingress_attached(name)) {
+            } else if (is_tc_ingress_attached(name, our_prog_id)) {
                 printf("    - %-12s: [ACTIVE] (ifindex %u, TC ingress filter active)\n", name, ifidx);
             } else {
                 printf("    - %-12s: [DETACHED / RECREATED] (ifindex %u, filter missing - run 'add-if %s' to reattach)\n",

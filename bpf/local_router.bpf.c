@@ -34,6 +34,13 @@ struct {
     __type(value, struct router_config);
 } router_config_map SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_LAN_IFACES);
+    __type(key, char[IFNAMSIZ]);
+    __type(value, __u32);
+} lan_ifaces_map SEC(".maps");
+
 static __always_inline void apply_mark(struct bpf_sock_addr *ctx) {
     __u32 zero = 0;
     struct router_config *cfg = bpf_map_lookup_elem(&router_config_map, &zero);
