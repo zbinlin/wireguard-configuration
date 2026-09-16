@@ -81,7 +81,9 @@ sudo ./router-ctl.sh start \
 
 参数说明：
 - `--cgroup-path <path>`：cgroup v2 挂载路径（默认 `/sys/fs/cgroup`）。
-- `--wg-endpoint <IP:Port>`：WireGuard 远端服务端地址与端口（防死锁回环，必填或在 nft 文件中定义）。
+- `--wg-endpoint <IP[:Port]>`：WireGuard 服务端地址（防死锁回环）。
+  - 支持带端口：如 `198.51.100.1:51820` 或 `[2001:db8::1]:51820`（仅匹配指定端口）。
+  - **支持不带端口**：如 `198.51.100.1` 或 `2001:db8::1`（匹配该 IP 的所有端口全部放行直连）。
 - `--rule-file <path>`：nftables 规则文件（如 `var.nft`）。
 - `--fwmark <mark>`：（可选）覆盖规则文件中的 FWMARK（如 `0x3000`）。
 
