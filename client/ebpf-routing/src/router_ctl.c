@@ -13,33 +13,8 @@
 #include <arpa/inet.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
+#include "router_common.h"
 #include "local_router.skel.h"
-
-#define DEFAULT_PIN_DIR "/sys/fs/bpf/wg_routing"
-#define DEFAULT_CGROUP_PATH "/sys/fs/cgroup"
-
-struct wg_endpoint {
-    __u32 ip4;           /* Network byte order */
-    __u32 ip6[4];        /* Network byte order */
-    __u16 port;          /* Network byte order */
-    __u8  family;        /* 2 = AF_INET, 10 = AF_INET6 */
-    __u8  enabled;       /* 1 = enabled, 0 = disabled */
-};
-
-struct router_config {
-    __u32 fwmark;
-    __u32 enabled;
-};
-
-struct ipv4_lpm_key {
-    __u32 prefixlen;
-    __u32 data;          /* Network byte order */
-};
-
-struct ipv6_lpm_key {
-    __u32 prefixlen;
-    __u8  data[16];      /* Network byte order */
-};
 
 static char *trim(char *str) {
     while (isspace((unsigned char)*str)) str++;
@@ -51,13 +26,27 @@ static char *trim(char *str) {
 }
 
 static int ensure_dir(const char *path) {
-    struct stat st;
-    if (stat(path, &st) == 0) {
-        if (S_ISDIR(st.st_mode)) return 0;
-        return -ENOTDIR;
+    if (!path || !*path) return -EINVAL;
+    char tmp[512];
+    size_t len = strnlen(path, sizeof(tmp));
+    if (len >= sizeof(tmp)) return -ENAMETOOLONG;
+    memcpy(tmp, path, len + 1);
+
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
+                struct stat st;
+                if (stat(tmp, &st) != 0 || !S_ISDIR(st.st_mode))
+                    return -errno;
+            }
+            *p = '/';
+        }
     }
-    if (mkdir(path, 0755) != 0) {
-        return -errno;
+    if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
+        struct stat st;
+        if (stat(tmp, &st) != 0 || !S_ISDIR(st.st_mode))
+            return -errno;
     }
     return 0;
 }
@@ -90,6 +79,50 @@ static void range_to_cidrs(uint32_t start, uint32_t end, void (*cb)(uint32_t net
     }
 }
 
+static int parse_port(const char *port_str, uint16_t *out_port) {
+    if (!port_str) return -1;
+    while (isspace((unsigned char)*port_str)) port_str++;
+    if (*port_str == '\0') return -1;
+
+    char *endptr = NULL;
+    errno = 0;
+    long val = strtol(port_str, &endptr, 10);
+    if (errno != 0 || endptr == port_str) {
+        return -1;
+    }
+    while (isspace((unsigned char)*endptr)) endptr++;
+    if (*endptr != '\0') {
+        return -1;
+    }
+    if (val <= 0 || val > 65535) {
+        return -1;
+    }
+    *out_port = (uint16_t)val;
+    return 0;
+}
+
+static int parse_fwmark(const char *str, uint32_t *out_mark) {
+    if (!str) return -1;
+    while (isspace((unsigned char)*str)) str++;
+    if (*str == '\0') return -1;
+
+    char *endptr = NULL;
+    errno = 0;
+    unsigned long val = strtoul(str, &endptr, 0);
+    if (errno != 0 || endptr == str) {
+        return -1;
+    }
+    while (isspace((unsigned char)*endptr)) endptr++;
+    if (*endptr != '\0') {
+        return -1;
+    }
+    if (val == 0 || val > UINT32_MAX) {
+        return -1; /* fwmark = 0 is invalid / unsafe (causes traffic leak) */
+    }
+    *out_mark = (uint32_t)val;
+    return 0;
+}
+
 static int parse_endpoint(const char *str, struct wg_endpoint *ep) {
     memset(ep, 0, sizeof(*ep));
     if (!str || strlen(str) == 0) return -1;
@@ -116,20 +149,20 @@ static int parse_endpoint(const char *str, struct wg_endpoint *ep) {
 
         if (*port_part == ':') {
             port_part++;
-            int port = atoi(port_part);
-            if (port <= 0 || port > 65535) {
-                fprintf(stderr, "Error: Invalid port '%s'\n", port_part);
+            uint16_t port = 0;
+            if (parse_port(port_part, &port) != 0) {
+                fprintf(stderr, "Error: Invalid port '%s' in endpoint '%s'\n", port_part, str);
                 return -1;
             }
-            ep->port = htons((uint16_t)port);
+            ep->port = htons(port);
         } else if (*port_part == '\0') {
             ep->port = 0; // Any port
         } else {
-            fprintf(stderr, "Error: Unexpected trailing characters in '%s'\n", str);
+            fprintf(stderr, "Error: Unexpected trailing characters in endpoint '%s'\n", str);
             return -1;
         }
 
-        ep->family = 10; // AF_INET6
+        ep->family = AF_INET6;
         ep->enabled = 1;
         return 0;
     }
@@ -140,7 +173,7 @@ static int parse_endpoint(const char *str, struct wg_endpoint *ep) {
             // Multiple colons -> Plain IPv6 without port (e.g. 2001:db8::1)
             if (inet_pton(AF_INET6, t, ep->ip6) == 1) {
                 ep->port = 0; // Any port
-                ep->family = 10; // AF_INET6
+                ep->family = AF_INET6;
                 ep->enabled = 1;
                 return 0;
             } else {
@@ -157,13 +190,13 @@ static int parse_endpoint(const char *str, struct wg_endpoint *ep) {
                 fprintf(stderr, "Error: Invalid IPv4 address '%s'\n", ip_part);
                 return -1;
             }
-            int port = atoi(port_part);
-            if (port <= 0 || port > 65535) {
-                fprintf(stderr, "Error: Invalid port '%s'\n", port_part);
+            uint16_t port = 0;
+            if (parse_port(port_part, &port) != 0) {
+                fprintf(stderr, "Error: Invalid port '%s' in endpoint '%s'\n", port_part, str);
                 return -1;
             }
-            ep->port = htons((uint16_t)port);
-            ep->family = 2; // AF_INET
+            ep->port = htons(port);
+            ep->family = AF_INET;
             ep->enabled = 1;
             return 0;
         }
@@ -171,7 +204,7 @@ static int parse_endpoint(const char *str, struct wg_endpoint *ep) {
         // No colon -> Plain IPv4 without port (e.g. 198.51.100.1)
         if (inet_pton(AF_INET, t, &ep->ip4) == 1) {
             ep->port = 0; // Any port
-            ep->family = 2; // AF_INET
+            ep->family = AF_INET;
             ep->enabled = 1;
             return 0;
         } else {
@@ -179,6 +212,32 @@ static int parse_endpoint(const char *str, struct wg_endpoint *ep) {
             return -1;
         }
     }
+}
+
+static bool match_keyword(const char *str, const char *keyword) {
+    size_t kwlen = strlen(keyword);
+    if (strncasecmp(str, keyword, kwlen) != 0)
+        return false;
+    char next = str[kwlen];
+    return (next == '\0' || isspace((unsigned char)next) || next == '=');
+}
+
+static const char *find_element_block(const char *line, const char *name) {
+    size_t name_len = strlen(name);
+    const char *p = line;
+    while ((p = strcasestr(p, name)) != NULL) {
+        if (p > line && (isalnum((unsigned char)*(p - 1)) || *(p - 1) == '_')) {
+            p += name_len;
+            continue;
+        }
+        char after = *(p + name_len);
+        if (after != '\0' && (isalnum((unsigned char)after) || after == '_')) {
+            p += name_len;
+            continue;
+        }
+        return p;
+    }
+    return NULL;
 }
 
 static int clear_lpm_map(int map_fd) {
@@ -206,29 +265,301 @@ static int count_map_keys(int map_fd) {
     return count;
 }
 
-struct v4_cb_arg {
-    int fd;
-    int count;
+struct rule_collector {
+    uint32_t fwmark;
+    bool has_fwmark;
+    char endpoint[256];
+    bool has_endpoint;
+
+    struct ipv4_lpm_key *v4_keys;
+    size_t v4_count;
+    size_t v4_cap;
+
+    struct ipv6_lpm_key *v6_keys;
+    size_t v6_count;
+    size_t v6_cap;
 };
 
-static void v4_cidr_cb(uint32_t net_be, uint32_t prefixlen, void *arg) {
-    struct v4_cb_arg *ctx = (struct v4_cb_arg *)arg;
-    struct ipv4_lpm_key key = {
-        .prefixlen = prefixlen,
-        .data = net_be,
-    };
-    uint8_t val = 1;
-    if (bpf_map_update_elem(ctx->fd, &key, &val, BPF_ANY) == 0) {
-        ctx->count++;
+static void v4_collect_cb(uint32_t net_be, uint32_t prefixlen, void *arg) {
+    struct rule_collector *rc = (struct rule_collector *)arg;
+    if (rc->v4_count >= rc->v4_cap) {
+        size_t new_cap = rc->v4_cap ? rc->v4_cap * 2 : 64;
+        struct ipv4_lpm_key *new_keys = realloc(rc->v4_keys, new_cap * sizeof(*new_keys));
+        if (!new_keys) return;
+        rc->v4_keys = new_keys;
+        rc->v4_cap = new_cap;
     }
+    rc->v4_keys[rc->v4_count].prefixlen = prefixlen;
+    rc->v4_keys[rc->v4_count].data = net_be;
+    rc->v4_count++;
 }
 
-static int apply_nft_rules(const char *rule_file, const char *wg_endpoint_str, const char *fwmark_override_str, const char *pin_dir) {
+static int add_v6_rule(struct rule_collector *rc, const uint8_t *ip6_bytes, uint32_t prefixlen) {
+    if (rc->v6_count >= rc->v6_cap) {
+        size_t new_cap = rc->v6_cap ? rc->v6_cap * 2 : 64;
+        struct ipv6_lpm_key *new_keys = realloc(rc->v6_keys, new_cap * sizeof(*new_keys));
+        if (!new_keys) return -1;
+        rc->v6_keys = new_keys;
+        rc->v6_cap = new_cap;
+    }
+    rc->v6_keys[rc->v6_count].prefixlen = prefixlen;
+    memcpy(rc->v6_keys[rc->v6_count].data, ip6_bytes, 16);
+    rc->v6_count++;
+    return 0;
+}
+
+static void free_rule_collector(struct rule_collector *rc) {
+    free(rc->v4_keys);
+    free(rc->v6_keys);
+    rc->v4_keys = NULL;
+    rc->v6_keys = NULL;
+    rc->v4_count = rc->v4_cap = 0;
+    rc->v6_count = rc->v6_cap = 0;
+}
+
+static int parse_rule_file(const char *rule_file, struct rule_collector *rc) {
     FILE *f = fopen(rule_file, "r");
     if (!f) {
         fprintf(stderr, "Error: Failed to open rule file '%s': %s\n",
                 rule_file, strerror(errno));
         return -1;
+    }
+
+    rc->fwmark = DEFAULT_FWMARK;
+    char line[512];
+    int line_num = 0;
+    int section = 0; // 0=none, 1=v4, 2=v6
+
+    while (fgets(line, sizeof(line), f)) {
+        line_num++;
+        char *p = strchr(line, '#');
+        if (p) *p = '\0';
+        char *t = trim(line);
+        if (*t == '\0') continue;
+
+        if (section == 0) {
+            if (match_keyword(t, "define FWMARK")) {
+                char *eq = strchr(t, '=');
+                if (!eq) {
+                    fprintf(stderr, "Error [line %d]: Malformed FWMARK definition (missing '='): %s\n", line_num, t);
+                    fclose(f);
+                    return -1;
+                }
+                char *v = trim(eq + 1);
+                if (parse_fwmark(v, &rc->fwmark) != 0) {
+                    fprintf(stderr, "Error [line %d]: Invalid or zero FWMARK value '%s'. A non-zero FWMARK is strictly required to prevent traffic leaks.\n", line_num, v);
+                    fclose(f);
+                    return -1;
+                }
+                rc->has_fwmark = true;
+                continue;
+            }
+
+            if (match_keyword(t, "define WG_ENDPOINT")) {
+                char *eq = strchr(t, '=');
+                if (!eq) {
+                    fprintf(stderr, "Error [line %d]: Malformed WG_ENDPOINT definition (missing '='): %s\n", line_num, t);
+                    fclose(f);
+                    return -1;
+                }
+                char *v = trim(eq + 1);
+                if (*v == '"' || *v == '\'') v++;
+                char *end = v + strlen(v) - 1;
+                if (end > v && (*end == '"' || *end == '\'')) *end = '\0';
+                v = trim(v);
+                struct wg_endpoint tmp_ep;
+                if (parse_endpoint(v, &tmp_ep) != 0) {
+                    fprintf(stderr, "Error [line %d]: Invalid WG_ENDPOINT '%s'\n", line_num, v);
+                    fclose(f);
+                    return -1;
+                }
+                strncpy(rc->endpoint, v, sizeof(rc->endpoint) - 1);
+                rc->has_endpoint = true;
+                continue;
+            }
+
+            const char *blk_v4 = find_element_block(t, "IPV4_ELEMENTS");
+            const char *blk_v6 = find_element_block(t, "IPV6_ELEMENTS");
+            if (blk_v4) {
+                const char *ob = strchr(blk_v4, '{');
+                if (!ob) {
+                    fprintf(stderr, "Error [line %d]: Missing '{' in IPV4_ELEMENTS definition\n", line_num);
+                    fclose(f);
+                    return -1;
+                }
+                section = 1;
+                t = (char *)(ob + 1);
+            } else if (blk_v6) {
+                const char *ob = strchr(blk_v6, '{');
+                if (!ob) {
+                    fprintf(stderr, "Error [line %d]: Missing '{' in IPV6_ELEMENTS definition\n", line_num);
+                    fclose(f);
+                    return -1;
+                }
+                section = 2;
+                t = (char *)(ob + 1);
+            } else {
+                continue;
+            }
+        }
+
+        if (section != 0) {
+            int cur_section = section;
+            char *cb = strchr(t, '}');
+            if (cb) {
+                *cb = '\0';
+                section = 0;
+            }
+
+            char *saveptr = NULL;
+            char *token = strtok_r(t, " ,\t\r\n", &saveptr);
+            while (token) {
+                if (cur_section == 1) { // IPv4
+                    if (strchr(token, '-')) {
+                        char s_ip[64] = {0}, e_ip[64] = {0};
+                        if (sscanf(token, "%63[^-]-%63s", s_ip, e_ip) != 2) {
+                            fprintf(stderr, "Error [line %d]: Malformed IPv4 range '%s'\n", line_num, token);
+                            fclose(f);
+                            return -1;
+                        }
+                        uint32_t s = 0, e = 0;
+                        if (inet_pton(AF_INET, trim(s_ip), &s) != 1) {
+                            fprintf(stderr, "Error [line %d]: Invalid start IP '%s' in range '%s'\n", line_num, s_ip, token);
+                            fclose(f);
+                            return -1;
+                        }
+                        if (inet_pton(AF_INET, trim(e_ip), &e) != 1) {
+                            fprintf(stderr, "Error [line %d]: Invalid end IP '%s' in range '%s'\n", line_num, e_ip, token);
+                            fclose(f);
+                            return -1;
+                        }
+                        if (ntohl(s) > ntohl(e)) {
+                            fprintf(stderr, "Error [line %d]: Inverted IPv4 range '%s' (start > end)\n", line_num, token);
+                            fclose(f);
+                            return -1;
+                        }
+                        range_to_cidrs(ntohl(s), ntohl(e), v4_collect_cb, rc);
+                    } else if (strchr(token, '/')) {
+                        char ip_str[64] = {0};
+                        uint32_t plen = 32;
+                        if (sscanf(token, "%63[^/]/%u", ip_str, &plen) != 2) {
+                            fprintf(stderr, "Error [line %d]: Malformed IPv4 CIDR '%s'\n", line_num, token);
+                            fclose(f);
+                            return -1;
+                        }
+                        if (plen > 32) {
+                            fprintf(stderr, "Error [line %d]: Invalid IPv4 prefix length /%u in '%s'\n", line_num, plen, token);
+                            fclose(f);
+                            return -1;
+                        }
+                        uint32_t net = 0;
+                        if (inet_pton(AF_INET, trim(ip_str), &net) != 1) {
+                            fprintf(stderr, "Error [line %d]: Invalid IPv4 address '%s' in '%s'\n", line_num, ip_str, token);
+                            fclose(f);
+                            return -1;
+                        }
+                        v4_collect_cb(net, plen, rc);
+                    } else {
+                        uint32_t net = 0;
+                        if (inet_pton(AF_INET, token, &net) != 1) {
+                            fprintf(stderr, "Error [line %d]: Invalid IPv4 address '%s'\n", line_num, token);
+                            fclose(f);
+                            return -1;
+                        }
+                        v4_collect_cb(net, 32, rc);
+                    }
+                } else if (cur_section == 2) { // IPv6
+                    char ip_str[64] = {0};
+                    uint32_t plen = 128;
+                    if (strchr(token, '/')) {
+                        if (sscanf(token, "%63[^/]/%u", ip_str, &plen) != 2) {
+                            fprintf(stderr, "Error [line %d]: Malformed IPv6 CIDR '%s'\n", line_num, token);
+                            fclose(f);
+                            return -1;
+                        }
+                        if (plen > 128) {
+                            fprintf(stderr, "Error [line %d]: Invalid IPv6 prefix length /%u in '%s'\n", line_num, plen, token);
+                            fclose(f);
+                            return -1;
+                        }
+                    } else {
+                        strncpy(ip_str, token, sizeof(ip_str) - 1);
+                    }
+                    uint8_t ip6_buf[16] = {0};
+                    if (inet_pton(AF_INET6, trim(ip_str), ip6_buf) != 1) {
+                        fprintf(stderr, "Error [line %d]: Invalid IPv6 address '%s'\n", line_num, ip_str);
+                        fclose(f);
+                        return -1;
+                    }
+                    if (add_v6_rule(rc, ip6_buf, plen) != 0) {
+                        fprintf(stderr, "Error: Memory allocation failure while parsing IPv6 rules\n");
+                        fclose(f);
+                        return -1;
+                    }
+                }
+                token = strtok_r(NULL, " ,\t\r\n", &saveptr);
+            }
+        }
+    }
+
+    fclose(f);
+
+    if (section != 0) {
+        fprintf(stderr, "Error: Unexpected EOF while parsing element block (missing closing '}')\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int do_stop(const char *pin_dir) {
+    if (!pin_dir) pin_dir = DEFAULT_PIN_DIR;
+    printf("[*] Stopping eBPF router and cleaning up pinned objects at %s...\n", pin_dir);
+    remove_pinned(pin_dir, "link_connect4");
+    remove_pinned(pin_dir, "link_sendmsg4");
+    remove_pinned(pin_dir, "link_connect6");
+    remove_pinned(pin_dir, "link_sendmsg6");
+
+    remove_pinned(pin_dir, "wg_endpoint_map");
+    remove_pinned(pin_dir, "bypass_v4_map");
+    remove_pinned(pin_dir, "bypass_v6_map");
+    remove_pinned(pin_dir, "router_config_map");
+
+    if (access(pin_dir, F_OK) == 0) {
+        if (rmdir(pin_dir) != 0 && errno != ENOENT) {
+            fprintf(stderr, "Warning: failed to remove directory '%s': %s\n", pin_dir, strerror(errno));
+        }
+    }
+    printf("[✔] Successfully stopped and unpinned.\n");
+    return 0;
+}
+
+static int apply_nft_rules(const char *rule_file, const char *wg_endpoint_str, const char *fwmark_override_str, const char *pin_dir) {
+    struct rule_collector rc = {0};
+
+    if (parse_rule_file(rule_file, &rc) != 0) {
+        free_rule_collector(&rc);
+        return -1;
+    }
+
+    if (fwmark_override_str) {
+        if (parse_fwmark(fwmark_override_str, &rc.fwmark) != 0) {
+            fprintf(stderr, "Error: Invalid or zero --fwmark override '%s'. A non-zero FWMARK is strictly required.\n", fwmark_override_str);
+            free_rule_collector(&rc);
+            return -1;
+        }
+    }
+
+    const char *target_ep = (wg_endpoint_str && strlen(wg_endpoint_str) > 0) ? wg_endpoint_str : (rc.has_endpoint ? rc.endpoint : NULL);
+    struct wg_endpoint ep;
+    bool has_valid_ep = false;
+    if (target_ep && strlen(target_ep) > 0) {
+        if (parse_endpoint(target_ep, &ep) != 0) {
+            fprintf(stderr, "Error: Invalid WireGuard endpoint '%s'\n", target_ep);
+            free_rule_collector(&rc);
+            return -1;
+        }
+        has_valid_ep = true;
     }
 
     printf("[*] Opening pinned BPF maps at %s...\n", pin_dir);
@@ -244,135 +575,44 @@ static int apply_nft_rules(const char *rule_file, const char *wg_endpoint_str, c
 
     if (cfg_fd < 0 || ep_fd < 0 || v4_fd < 0 || v6_fd < 0) {
         fprintf(stderr, "Error: Failed to open pinned maps. Is the router loaded?\n");
-        fclose(f);
         if (cfg_fd >= 0) close(cfg_fd);
         if (ep_fd >= 0) close(ep_fd);
         if (v4_fd >= 0) close(v4_fd);
         if (v6_fd >= 0) close(v6_fd);
+        free_rule_collector(&rc);
         return -1;
     }
-
-    uint32_t fwmark = 0x100;
-    char file_endpoint[256] = {0};
-    char line[512];
-    int section = 0; // 0=none, 1=v4, 2=v6
 
     clear_lpm_map(v4_fd);
     clear_lpm_map(v6_fd);
 
-    struct v4_cb_arg v4_ctx = { .fd = v4_fd, .count = 0 };
-    int v6_count = 0;
-
-    while (fgets(line, sizeof(line), f)) {
-        char *p = strchr(line, '#');
-        if (p) *p = '\0';
-        char *t = trim(line);
-        if (*t == '\0') continue;
-
-        if (strncasecmp(t, "define FWMARK", 13) == 0) {
-            char *eq = strchr(t, '=');
-            if (eq) {
-                fwmark = (uint32_t)strtoul(trim(eq + 1), NULL, 0);
-            }
-            continue;
-        }
-
-        if (strncasecmp(t, "define WG_ENDPOINT", 18) == 0) {
-            char *eq = strchr(t, '=');
-            if (eq) {
-                char *v = trim(eq + 1);
-                if (*v == '"' || *v == '\'') v++;
-                char *end = v + strlen(v) - 1;
-                if (end > v && (*end == '"' || *end == '\'')) *end = '\0';
-                strncpy(file_endpoint, v, sizeof(file_endpoint)-1);
-            }
-            continue;
-        }
-
-        if (strcasestr(t, "IPV4_ELEMENTS") && strchr(t, '{')) {
-            section = 1;
-            continue;
-        }
-        if (strcasestr(t, "IPV6_ELEMENTS") && strchr(t, '{')) {
-            section = 2;
-            continue;
-        }
-        if (strchr(t, '}')) {
-            section = 0;
-            continue;
-        }
-
-        if (section == 1) { // IPv4
-            char *comma = strchr(t, ',');
-            if (comma) *comma = '\0';
-            t = trim(t);
-            if (*t == '\0') continue;
-
-            if (strchr(t, '-')) {
-                char s_ip[64] = {0}, e_ip[64] = {0};
-                if (sscanf(t, "%63[^-]-%63s", s_ip, e_ip) == 2) {
-                    uint32_t s = 0, e = 0;
-                    if (inet_pton(AF_INET, trim(s_ip), &s) == 1 &&
-                        inet_pton(AF_INET, trim(e_ip), &e) == 1) {
-                        range_to_cidrs(ntohl(s), ntohl(e), v4_cidr_cb, &v4_ctx);
-                    }
-                }
-            } else if (strchr(t, '/')) {
-                char ip_str[64] = {0};
-                uint32_t plen = 32;
-                if (sscanf(t, "%63[^/]/%u", ip_str, &plen) == 2) {
-                    uint32_t net = 0;
-                    if (inet_pton(AF_INET, trim(ip_str), &net) == 1) {
-                        v4_cidr_cb(net, plen, &v4_ctx);
-                    }
-                }
-            } else {
-                uint32_t net = 0;
-                if (inet_pton(AF_INET, t, &net) == 1) {
-                    v4_cidr_cb(net, 32, &v4_ctx);
-                }
-            }
-        } else if (section == 2) { // IPv6
-            char *comma = strchr(t, ',');
-            if (comma) *comma = '\0';
-            t = trim(t);
-            if (*t == '\0') continue;
-
-            char ip_str[64] = {0};
-            uint32_t plen = 128;
-            if (strchr(t, '/')) {
-                sscanf(t, "%63[^/]/%u", ip_str, &plen);
-            } else {
-                strncpy(ip_str, t, sizeof(ip_str)-1);
-            }
-            struct ipv6_lpm_key k6 = { .prefixlen = plen };
-            if (inet_pton(AF_INET6, trim(ip_str), k6.data) == 1) {
-                uint8_t val = 1;
-                if (bpf_map_update_elem(v6_fd, &k6, &val, BPF_ANY) == 0) {
-                    v6_count++;
-                }
-            }
+    int v4_loaded = 0;
+    for (size_t i = 0; i < rc.v4_count; i++) {
+        uint8_t val = 1;
+        if (bpf_map_update_elem(v4_fd, &rc.v4_keys[i], &val, BPF_ANY) == 0) {
+            v4_loaded++;
         }
     }
-    fclose(f);
 
-    if (fwmark_override_str) {
-        fwmark = (uint32_t)strtoul(fwmark_override_str, NULL, 0);
+    int v6_loaded = 0;
+    for (size_t i = 0; i < rc.v6_count; i++) {
+        uint8_t val = 1;
+        if (bpf_map_update_elem(v6_fd, &rc.v6_keys[i], &val, BPF_ANY) == 0) {
+            v6_loaded++;
+        }
     }
 
     /* 1. Update Config Map */
     uint32_t zero = 0;
     struct router_config cfg = {
-        .fwmark = fwmark,
+        .fwmark = rc.fwmark,
         .enabled = 1,
     };
     bpf_map_update_elem(cfg_fd, &zero, &cfg, BPF_ANY);
-    printf("  -> Configured FWMARK: 0x%x (%u)\n", fwmark, fwmark);
+    printf("  -> Configured FWMARK: 0x%x (%u)\n", rc.fwmark, rc.fwmark);
 
     /* 2. Update WireGuard Endpoint */
-    const char *target_ep = (wg_endpoint_str && strlen(wg_endpoint_str) > 0) ? wg_endpoint_str : file_endpoint;
-    struct wg_endpoint ep;
-    if (target_ep && strlen(target_ep) > 0 && parse_endpoint(target_ep, &ep) == 0) {
+    if (has_valid_ep) {
         bpf_map_update_elem(ep_fd, &zero, &ep, BPF_ANY);
         printf("  -> WireGuard Endpoint (Anti-loopback): %s\n", target_ep);
     } else {
@@ -381,31 +621,15 @@ static int apply_nft_rules(const char *rule_file, const char *wg_endpoint_str, c
         printf("  -> WireGuard Endpoint: Disabled\n");
     }
 
-    printf("  -> Loaded %d IPv4 CIDR rules into bypass_v4_map (including decomposed ranges)\n", v4_ctx.count);
-    printf("  -> Loaded %d IPv6 CIDR rules into bypass_v6_map\n", v6_count);
+    printf("  -> Loaded %d IPv4 CIDR rules into bypass_v4_map (including decomposed ranges)\n", v4_loaded);
+    printf("  -> Loaded %d IPv6 CIDR rules into bypass_v6_map\n", v6_loaded);
     printf("[✔] Successfully applied all routing rules!\n");
 
     close(cfg_fd);
     close(ep_fd);
     close(v4_fd);
     close(v6_fd);
-    return 0;
-}
-
-static int do_stop(const char *pin_dir) {
-    printf("[*] Stopping eBPF router and cleaning up pinned objects at %s...\n", pin_dir);
-    remove_pinned(pin_dir, "link_connect4");
-    remove_pinned(pin_dir, "link_sendmsg4");
-    remove_pinned(pin_dir, "link_connect6");
-    remove_pinned(pin_dir, "link_sendmsg6");
-
-    remove_pinned(pin_dir, "wg_endpoint_map");
-    remove_pinned(pin_dir, "bypass_v4_map");
-    remove_pinned(pin_dir, "bypass_v6_map");
-    remove_pinned(pin_dir, "router_config_map");
-
-    rmdir(pin_dir);
-    printf("[✔] Successfully stopped and unpinned.\n");
+    free_rule_collector(&rc);
     return 0;
 }
 
@@ -424,8 +648,9 @@ static int do_start(const char *cgroup_path, const char *rule_file, const char *
         return 1;
     }
 
-    if (ensure_dir(pin_dir) != 0) {
-        fprintf(stderr, "Error: Failed to create bpffs dir %s: %s\n", pin_dir, strerror(errno));
+    int err = ensure_dir(pin_dir);
+    if (err != 0) {
+        fprintf(stderr, "Error: Failed to create bpffs dir %s: %s\n", pin_dir, strerror(-err));
         close(cgroup_fd);
         return 1;
     }
@@ -453,16 +678,18 @@ static int do_start(const char *cgroup_path, const char *rule_file, const char *
         return 1;
     }
 
-    int err = local_router_bpf__load(skel);
+    err = local_router_bpf__load(skel);
     if (err) {
         fprintf(stderr, "Error: Failed to load BPF skeleton: %d (%s)\n", err, strerror(-err));
-        goto cleanup;
+        close(cgroup_fd);
+        local_router_bpf__destroy(skel);
+        return 1;
     }
 
     err = bpf_object__pin_maps(skel->obj, pin_dir);
     if (err && err != -EEXIST) {
         fprintf(stderr, "Error: Failed to pin maps: %d\n", err);
-        goto cleanup;
+        goto cleanup_rollback;
     }
 
     char link_path[512];
@@ -470,62 +697,88 @@ static int do_start(const char *cgroup_path, const char *rule_file, const char *
     if (!skel->links.sock_connect4) {
         fprintf(stderr, "Error: Failed to attach sock_connect4\n");
         err = -errno;
-        goto cleanup;
+        goto cleanup_rollback;
     }
     snprintf(link_path, sizeof(link_path), "%s/link_connect4", pin_dir);
-    bpf_link__pin(skel->links.sock_connect4, link_path);
+    err = bpf_link__pin(skel->links.sock_connect4, link_path);
+    if (err) {
+        fprintf(stderr, "Error: Failed to pin sock_connect4: %d\n", err);
+        goto cleanup_rollback;
+    }
 
     skel->links.sock_sendmsg4 = bpf_program__attach_cgroup(skel->progs.sock_sendmsg4, cgroup_fd);
     if (!skel->links.sock_sendmsg4) {
         fprintf(stderr, "Error: Failed to attach sock_sendmsg4\n");
         err = -errno;
-        goto cleanup;
+        goto cleanup_rollback;
     }
     snprintf(link_path, sizeof(link_path), "%s/link_sendmsg4", pin_dir);
-    bpf_link__pin(skel->links.sock_sendmsg4, link_path);
+    err = bpf_link__pin(skel->links.sock_sendmsg4, link_path);
+    if (err) {
+        fprintf(stderr, "Error: Failed to pin sock_sendmsg4: %d\n", err);
+        goto cleanup_rollback;
+    }
 
     skel->links.sock_connect6 = bpf_program__attach_cgroup(skel->progs.sock_connect6, cgroup_fd);
     if (!skel->links.sock_connect6) {
         fprintf(stderr, "Error: Failed to attach sock_connect6\n");
         err = -errno;
-        goto cleanup;
+        goto cleanup_rollback;
     }
     snprintf(link_path, sizeof(link_path), "%s/link_connect6", pin_dir);
-    bpf_link__pin(skel->links.sock_connect6, link_path);
+    err = bpf_link__pin(skel->links.sock_connect6, link_path);
+    if (err) {
+        fprintf(stderr, "Error: Failed to pin sock_connect6: %d\n", err);
+        goto cleanup_rollback;
+    }
 
     skel->links.sock_sendmsg6 = bpf_program__attach_cgroup(skel->progs.sock_sendmsg6, cgroup_fd);
     if (!skel->links.sock_sendmsg6) {
         fprintf(stderr, "Error: Failed to attach sock_sendmsg6\n");
         err = -errno;
-        goto cleanup;
+        goto cleanup_rollback;
     }
     snprintf(link_path, sizeof(link_path), "%s/link_sendmsg6", pin_dir);
-    bpf_link__pin(skel->links.sock_sendmsg6, link_path);
+    err = bpf_link__pin(skel->links.sock_sendmsg6, link_path);
+    if (err) {
+        fprintf(stderr, "Error: Failed to pin sock_sendmsg6: %d\n", err);
+        goto cleanup_rollback;
+    }
 
     printf("[+] Successfully loaded and attached eBPF programs to cgroup '%s'!\n", cgroup_path);
 
     /* Apply rules */
     err = apply_nft_rules(rule_file, wg_endpoint, fwmark, pin_dir);
+    if (err) {
+        fprintf(stderr, "Error: Failed to apply routing rules from '%s'\n", rule_file);
+        goto cleanup_rollback;
+    }
 
-cleanup:
     close(cgroup_fd);
     local_router_bpf__destroy(skel);
-    return err ? 1 : 0;
+    return 0;
+
+cleanup_rollback:
+    fprintf(stderr, "[!] Start failed; rolling back and cleaning up pinned objects at %s...\n", pin_dir);
+    do_stop(pin_dir);
+    close(cgroup_fd);
+    local_router_bpf__destroy(skel);
+    return 1;
 }
 
 static int do_set_endpoint(const char *endpoint_str, const char *pin_dir) {
     if (!pin_dir) pin_dir = DEFAULT_PIN_DIR;
+
+    struct wg_endpoint ep;
+    if (parse_endpoint(endpoint_str, &ep) != 0) {
+        return 1;
+    }
+
     char path[512];
     snprintf(path, sizeof(path), "%s/wg_endpoint_map", pin_dir);
     int ep_fd = bpf_obj_get(path);
     if (ep_fd < 0) {
         fprintf(stderr, "Error: Failed to open wg_endpoint_map at %s. Is the router loaded?\n", pin_dir);
-        return 1;
-    }
-
-    struct wg_endpoint ep;
-    if (parse_endpoint(endpoint_str, &ep) != 0) {
-        close(ep_fd);
         return 1;
     }
 
@@ -570,7 +823,7 @@ static int do_status(const char *pin_dir) {
         if (bpf_map_lookup_elem(ep_fd, &zero, &ep) == 0) {
             if (ep.enabled) {
                 uint16_t port = ntohs(ep.port);
-                if (ep.family == 2) {
+                if (ep.family == AF_INET) {
                     char ip_buf[INET_ADDRSTRLEN];
                     inet_ntop(AF_INET, &ep.ip4, ip_buf, sizeof(ip_buf));
                     if (port == 0) {
@@ -634,6 +887,7 @@ static void print_usage(const char *prog) {
     printf("                 Options: --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n");
 }
 
+#ifndef UNIT_TESTING
 int main(int argc, char **argv) {
     if (argc < 2) {
         print_usage(argv[0]);
@@ -738,3 +992,4 @@ int main(int argc, char **argv) {
         return 1;
     }
 }
+#endif
