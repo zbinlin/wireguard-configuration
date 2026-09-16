@@ -2,7 +2,6 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
 
 BUILD_BIN="$SCRIPT_DIR/build/router_ctl"
 TARGET_BIN="$SCRIPT_DIR/target/router_ctl"
