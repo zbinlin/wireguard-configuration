@@ -47,6 +47,8 @@ then
     exit 1
 fi
 
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd -P )"
+
 : ${WG_DEV:=$INTERFACE}
 
 if [[ -z "$ENDPOINT" ]];
@@ -63,16 +65,16 @@ fi
 
 case $1 in
     (up)
-        cd "$( dirname "${BASH_SOURCE[0]}" )"
-		  if [[ ${METHOD} == "ebpf" ]];
-		  then
-			  ./ebpf-routing/router-ctl.sh start \
-				  --cgroup-path /sys/fs/cgroup \
-				  --wg-endpoint $ENDPOINT \
-				  --rule-file ./data/var.nft
-		  else
-			  nft -f ./domestic.nft
-		  fi
+        if [[ ${METHOD} == "ebpf" ]];
+        then
+            ${DIR}/ebpf-routing/router-ctl.sh start \
+                --cgroup-path /sys/fs/cgroup \
+                --pin-dir /sys/fs/bpf/wg_routing \
+                --wg-endpoint $ENDPOINT \
+                --rule-file ${DIR}/data/var.nft
+        else
+            nft -f ${DIR}/domestic.nft
+        fi
         ip -4 route add 0.0.0.0/0 dev $WG_DEV table $FWMARK
         ip -6 route add ::/0 dev $WG_DEV table $FWMARK
         ip -4 rule add table main suppress_prefixlength 0
@@ -97,12 +99,12 @@ case $1 in
         ip -4 rule delete fwmark $FWMARK table $FWMARK || true
         ip -6 rule delete table main suppress_prefixlength 0 || true
         ip -4 rule delete table main suppress_prefixlength 0 || true
-		  if [[ ${METHOD} == "ebpf" ]];
-		  then
-			  ./ebpf-routing/router-ctl.sh stop
-		  else
-			  nft delete table inet wg.domestic || true
-		  fi
+        if [[ ${METHOD} == "ebpf" ]];
+        then
+            ${DIR}/ebpf-routing/router-ctl.sh stop --pin-dir /sys/fs/bpf/wg_routing || true
+        else
+            nft destroy table inet wg.domestic || nft delete table inet wg.domestic || true
+        fi
         ;;
     (*)
         usage

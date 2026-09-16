@@ -14,7 +14,7 @@ chmod 0700 ${CONFIG_FILE_DIR}
 
 CONFIG_FILE_PATH="${CONFIG_FILE_DIR}/${RND_INTERFACE}.conf"
 
-DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd -P )"
 
 __cleanup() {
     ret=$?
@@ -32,8 +32,7 @@ exists() {
     return $?
 }
 
-ebpf_routing_avaiable=$(cd ebpf-routing && make)
-if [[ -z $ebpf_routing_avaiable ]];
+if (cd ${DIR}/ebpf-routing && make >/dev/null);
 then
     method=ebpf
 elif exists nft
@@ -44,15 +43,15 @@ fi
 if [[ -n "${method}" ]]
 then
     hooks=$(cat <<EOF
-PostUp = export ENDPOINT=${ENDPOINT}; export FWMARK=0x00003000; export WG_DEV=${RND_INTERFACE}; source ${DIR}/hook.sh -m ${method} up
-PreDown = export ENDPOINT=${ENDPOINT}; export FWMARK=0x00003000; export WG_DEV=${RND_INTERFACE}; source ${DIR}/hook.sh -m ${method} down
+PostUp = export ENDPOINT=${ENDPOINT}; export FWMARK=0x00003000; export WG_DEV=${RND_INTERFACE}; bash ${DIR}/hook.sh -m ${method} up
+PreDown = export ENDPOINT=${ENDPOINT}; export FWMARK=0x00003000; export WG_DEV=${RND_INTERFACE}; bash ${DIR}/hook.sh -m ${method} down
 Table = off
 EOF
     )
 else
     hooks=$(cat <<EOF
-PostUp = export PRIORITY=1024; source ${DIR}/post-up.sh
-PreDown = export PRIORITY=1024; source ${DIR}/pre-down.sh
+PostUp = export PRIORITY=1024; bash ${DIR}/post-up.sh
+PreDown = export PRIORITY=1024; bash ${DIR}/pre-down.sh
 EOF
     )
 fi
