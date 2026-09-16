@@ -5,25 +5,40 @@ set -e
 : ${FWMARK:=0x00003000}
 
 usage() {
-	echo "Usage: $0 [option] <up|down>"
-	echo "options:"
-	echo "    -i INTERFACE    interface"
-	echo "    -h              Help"
+    echo "Usage: $0 [option] <up|down>"
+    echo "options:"
+    echo "    -i INTERFACE    interface"
+    echo "    -m METHOD       ebpf/nft"
+    echo "    -h              Help"
 }
 
-while getopts ":i:" option;
-do
-	case $option in
-		i)
-			INTERFACE=$OPTARG
-			;;
-		\?)
-			usage
-			exit 1
-			;;
-	esac
+while getopts ":i:m:h" option; do
+    case "$option" in
+        i)
+            INTERFACE="$OPTARG"
+            ;;
+        m)
+            METHOD="$OPTARG"
+            ;;
+        h)
+            usage
+            exit 0
+            ;;
+        \?)
+            echo "Invalid option: -$OPTARG" >&2
+            usage
+            exit 1
+            ;;
+        :)
+            echo "Option -$OPTARG requires an argument." >&2
+            usage
+            exit 1
+            ;;
+    esac
 done
-shift `expr $OPTIND - 1`
+
+shift $((OPTIND - 1))
+
 
 if [[ $1 == "" ]]
 then
@@ -49,7 +64,15 @@ fi
 case $1 in
     (up)
         cd "$( dirname "${BASH_SOURCE[0]}" )"
-        nft -f ./domestic.nft
+		  if [[ ${METHOD} == "ebpf" ]];
+		  then
+			  ./ebpf-routing/router-ctl.sh start \
+				  --cgroup-path /sys/fs/cgroup \
+				  --wg-endpoint $ENDPOINT \
+				  --rule-file ./data/var.nft
+		  else
+			  nft -f ./domestic.nft
+		  fi
         ip -4 route add 0.0.0.0/0 dev $WG_DEV table $FWMARK
         ip -6 route add ::/0 dev $WG_DEV table $FWMARK
         ip -4 rule add table main suppress_prefixlength 0
@@ -74,7 +97,12 @@ case $1 in
         ip -4 rule delete fwmark $FWMARK table $FWMARK || true
         ip -6 rule delete table main suppress_prefixlength 0 || true
         ip -4 rule delete table main suppress_prefixlength 0 || true
-        nft delete table inet wg.domestic || true
+		  if [[ ${METHOD} == "ebpf" ]];
+		  then
+			  ./ebpf-routing/router-ctl.sh stop
+		  else
+			  nft delete table inet wg.domestic || true
+		  fi
         ;;
     (*)
         usage

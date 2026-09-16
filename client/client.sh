@@ -32,11 +32,20 @@ exists() {
     return $?
 }
 
-if exists nft
+ebpf_routing_avaiable=$(cd ebpf-routing && make)
+if [[ -z $ebpf_routing_avaiable ]];
+then
+    method=ebpf
+elif exists nft
+then
+    method=nft
+fi
+
+if [[ -n "${method}" ]]
 then
     hooks=$(cat <<EOF
-PostUp = export ENDPOINT=${ENDPOINT}; export FWMARK=0x00003000; export WG_DEV=${RND_INTERFACE}; source ${DIR}/hook.sh up
-PreDown = export ENDPOINT=${ENDPOINT}; export FWMARK=0x00003000; export WG_DEV=${RND_INTERFACE}; source ${DIR}/hook.sh down
+PostUp = export ENDPOINT=${ENDPOINT}; export FWMARK=0x00003000; export WG_DEV=${RND_INTERFACE}; source ${DIR}/hook.sh -m ${method} up
+PreDown = export ENDPOINT=${ENDPOINT}; export FWMARK=0x00003000; export WG_DEV=${RND_INTERFACE}; source ${DIR}/hook.sh -m ${method} down
 Table = off
 EOF
     )
