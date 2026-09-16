@@ -443,6 +443,22 @@ static int do_start(const char *cgroup_path, const char *rule_file, const char *
         return 1;
     }
 
+    /* Clean up any leftover pinned objects from previous runs */
+    remove_pinned("link_connect4");
+    remove_pinned("link_sendmsg4");
+    remove_pinned("link_connect6");
+    remove_pinned("link_sendmsg6");
+    remove_pinned("wg_endpoint_map");
+    remove_pinned("bypass_v4_map");
+    remove_pinned("bypass_v6_map");
+    remove_pinned("router_config_map");
+
+    /* Also clean up any accidental root bpffs pins from earlier versions */
+    unlink("/sys/fs/bpf/wg_endpoint_map");
+    unlink("/sys/fs/bpf/bypass_v4_map");
+    unlink("/sys/fs/bpf/bypass_v6_map");
+    unlink("/sys/fs/bpf/router_config_map");
+
     struct local_router_bpf *skel = local_router_bpf__open();
     if (!skel) {
         fprintf(stderr, "Error: Failed to open BPF skeleton\n");
