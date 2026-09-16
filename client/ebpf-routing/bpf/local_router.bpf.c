@@ -86,7 +86,7 @@ static __always_inline bool should_bypass_v4(__u32 user_ip4, __u32 user_port) {
     __u32 zero = 0;
     struct wg_endpoint *ep = bpf_map_lookup_elem(&wg_endpoint_map, &zero);
     if (ep && ep->enabled && ep->family == AF_INET) {
-        if (user_ip4 == ep->ip4 && (__u16)user_port == ep->port)
+        if (user_ip4 == ep->ip4 && (ep->port == 0 || (__u16)user_port == ep->port))
             return true;
     }
 
@@ -123,7 +123,7 @@ static __always_inline bool should_bypass_v6(const __u32 *user_ip6, __u32 user_p
             user_ip6[1] == ep->ip6[1] &&
             user_ip6[2] == ep->ip6[2] &&
             user_ip6[3] == ep->ip6[3] &&
-            (__u16)user_port == ep->port)
+            (ep->port == 0 || (__u16)user_port == ep->port))
             return true;
     }
 

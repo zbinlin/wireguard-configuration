@@ -97,53 +97,87 @@ static int parse_endpoint(const char *str, struct wg_endpoint *ep) {
     char buf[256];
     strncpy(buf, str, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
+    char *t = trim(buf);
 
-    if (buf[0] == '[') { // IPv6: [addr]:port
-        char *close_bracket = strchr(buf, ']');
-        if (!close_bracket || *(close_bracket + 1) != ':') {
-            fprintf(stderr, "Error: Invalid IPv6 endpoint format '%s'. Expected '[ipv6]:port'\n", str);
+    if (t[0] == '[') { // IPv6 in brackets: [addr] or [addr]:port
+        char *close_bracket = strchr(t, ']');
+        if (!close_bracket) {
+            fprintf(stderr, "Error: Missing closing bracket ']' in IPv6 endpoint '%s'\n", str);
             return -1;
         }
         *close_bracket = '\0';
-        char *ip_part = buf + 1;
-        char *port_part = close_bracket + 2;
+        char *ip_part = t + 1;
+        char *port_part = close_bracket + 1;
 
         if (inet_pton(AF_INET6, ip_part, ep->ip6) != 1) {
             fprintf(stderr, "Error: Invalid IPv6 address '%s'\n", ip_part);
             return -1;
         }
-        int port = atoi(port_part);
-        if (port <= 0 || port > 65535) {
-            fprintf(stderr, "Error: Invalid port '%s'\n", port_part);
+
+        if (*port_part == ':') {
+            port_part++;
+            int port = atoi(port_part);
+            if (port <= 0 || port > 65535) {
+                fprintf(stderr, "Error: Invalid port '%s'\n", port_part);
+                return -1;
+            }
+            ep->port = htons((uint16_t)port);
+        } else if (*port_part == '\0') {
+            ep->port = 0; // Any port
+        } else {
+            fprintf(stderr, "Error: Unexpected trailing characters in '%s'\n", str);
             return -1;
         }
-        ep->port = htons((uint16_t)port);
+
         ep->family = 10; // AF_INET6
         ep->enabled = 1;
         return 0;
-    } else { // IPv4: addr:port
-        char *colon = strchr(buf, ':');
-        if (!colon) {
-            fprintf(stderr, "Error: Invalid IPv4 endpoint format '%s'. Expected 'ipv4:port'\n", str);
-            return -1;
-        }
-        *colon = '\0';
-        char *ip_part = buf;
-        char *port_part = colon + 1;
+    }
 
-        if (inet_pton(AF_INET, ip_part, &ep->ip4) != 1) {
-            fprintf(stderr, "Error: Invalid IPv4 address '%s'\n", ip_part);
+    char *colon = strchr(t, ':');
+    if (colon) {
+        if (strchr(colon + 1, ':') != NULL) {
+            // Multiple colons -> Plain IPv6 without port (e.g. 2001:db8::1)
+            if (inet_pton(AF_INET6, t, ep->ip6) == 1) {
+                ep->port = 0; // Any port
+                ep->family = 10; // AF_INET6
+                ep->enabled = 1;
+                return 0;
+            } else {
+                fprintf(stderr, "Error: Invalid IPv6 address '%s'\n", str);
+                return -1;
+            }
+        } else {
+            // Exactly one colon -> IPv4 with port (e.g. 198.51.100.1:51820)
+            *colon = '\0';
+            char *ip_part = t;
+            char *port_part = colon + 1;
+
+            if (inet_pton(AF_INET, ip_part, &ep->ip4) != 1) {
+                fprintf(stderr, "Error: Invalid IPv4 address '%s'\n", ip_part);
+                return -1;
+            }
+            int port = atoi(port_part);
+            if (port <= 0 || port > 65535) {
+                fprintf(stderr, "Error: Invalid port '%s'\n", port_part);
+                return -1;
+            }
+            ep->port = htons((uint16_t)port);
+            ep->family = 2; // AF_INET
+            ep->enabled = 1;
+            return 0;
+        }
+    } else {
+        // No colon -> Plain IPv4 without port (e.g. 198.51.100.1)
+        if (inet_pton(AF_INET, t, &ep->ip4) == 1) {
+            ep->port = 0; // Any port
+            ep->family = 2; // AF_INET
+            ep->enabled = 1;
+            return 0;
+        } else {
+            fprintf(stderr, "Error: Invalid IPv4 address '%s'\n", str);
             return -1;
         }
-        int port = atoi(port_part);
-        if (port <= 0 || port > 65535) {
-            fprintf(stderr, "Error: Invalid port '%s'\n", port_part);
-            return -1;
-        }
-        ep->port = htons((uint16_t)port);
-        ep->family = 2; // AF_INET
-        ep->enabled = 1;
-        return 0;
     }
 }
 
@@ -534,11 +568,19 @@ static int do_status(void) {
                 if (ep.family == 2) {
                     char ip_buf[INET_ADDRSTRLEN];
                     inet_ntop(AF_INET, &ep.ip4, ip_buf, sizeof(ip_buf));
-                    printf("  WireGuard Endpoint: %s:%u\n", ip_buf, port);
+                    if (port == 0) {
+                        printf("  WireGuard Endpoint: %s (all ports)\n", ip_buf);
+                    } else {
+                        printf("  WireGuard Endpoint: %s:%u\n", ip_buf, port);
+                    }
                 } else {
                     char ip_buf[INET6_ADDRSTRLEN];
                     inet_ntop(AF_INET6, ep.ip6, ip_buf, sizeof(ip_buf));
-                    printf("  WireGuard Endpoint: [%s]:%u\n", ip_buf, port);
+                    if (port == 0) {
+                        printf("  WireGuard Endpoint: [%s] (all ports)\n", ip_buf);
+                    } else {
+                        printf("  WireGuard Endpoint: [%s]:%u\n", ip_buf, port);
+                    }
                 }
             } else {
                 printf("  WireGuard Endpoint: None\n");
@@ -568,16 +610,16 @@ static void print_usage(const char *prog) {
     printf("Usage: %s <start|stop|reload|set-endpoint|status> [options]\n\n", prog);
     printf("Commands:\n");
     printf("  start          Load eBPF, attach to cgroup, and apply nftables rules\n");
-    printf("                 Options: --cgroup-path <path>  (default: /sys/fs/cgroup)\n");
-    printf("                          --wg-endpoint <IP:Port>\n");
-    printf("                          --rule-file <var.nft> (required)\n");
-    printf("                          --fwmark <mark>       (optional override)\n\n");
+    printf("                 Options: --cgroup-path <path>    (default: /sys/fs/cgroup)\n");
+    printf("                          --wg-endpoint <IP[:Port]>\n");
+    printf("                          --rule-file <var.nft>   (required)\n");
+    printf("                          --fwmark <mark>         (optional override)\n\n");
     printf("  stop           Detach eBPF programs and remove pinned objects\n\n");
     printf("  reload         Hot-reload nftables rule file into BPF maps (no detach)\n");
-    printf("                 Options: --rule-file <var.nft> (required)\n");
-    printf("                          --wg-endpoint <IP:Port>\n");
+    printf("                 Options: --rule-file <var.nft>   (required)\n");
+    printf("                          --wg-endpoint <IP[:Port]>\n");
     printf("                          --fwmark <mark>\n\n");
-    printf("  set-endpoint   Dynamically update WireGuard endpoint (IP:Port)\n\n");
+    printf("  set-endpoint   Dynamically update WireGuard endpoint (IP[:Port])\n\n");
     printf("  status         Show current eBPF router status and map statistics\n");
 }
 
