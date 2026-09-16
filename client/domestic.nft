@@ -20,8 +20,7 @@ table inet wg.domestic {
     # 创建一个用于 MSS Clamping 的新链
     chain clamp_mss {
         comment "MSS Clamping Chain" ;
-        # 仅匹配 TCP 协议的 SYN 包（连接建立的第一个包）
-        tcp flags & (fin|syn|rst|ack) == syn \
+        tcp flags syn \
         # 将 MSS 值钳制在 wg0 的 MTU (1280) 减去 IP/TCP 头部大小 (40+20=60 for IPv4, 60+20=80 for IPv6)
         # 为了安全起见，我们用 1280 - 80 = 1200
         counter tcp option maxseg size set rt mtu
