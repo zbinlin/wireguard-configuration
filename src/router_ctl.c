@@ -258,13 +258,21 @@ static int tc_attach_interface(int prog_fd, const char *ifname) {
         return -1;
     }
 
-    /* 2. Attach TC ingress filter */
+    /* 2. Attach TC ingress filter with fixed handle=1 and priority=1 */
     struct bpf_tc_opts opts = {
         .sz = sizeof(opts),
         .prog_fd = prog_fd,
         .flags = BPF_TC_F_REPLACE,
+        .handle = 1,
+        .priority = 1,
     };
     err = bpf_tc_attach(&hook, &opts);
+    if (err) {
+        /* Fallback: let kernel auto-allocate if fixed priority is rejected */
+        opts.handle = 0;
+        opts.priority = 0;
+        err = bpf_tc_attach(&hook, &opts);
+    }
     if (err) {
         fprintf(stderr, "Error: Failed to attach TC ingress filter to %s: %d (%s)\n",
                 ifname, err, strerror(-err));
@@ -288,11 +296,37 @@ static int tc_detach_interface(const char *ifname) {
     };
     struct bpf_tc_opts opts = {
         .sz = sizeof(opts),
-        .prog_id = 0,
+        .handle = 1,
+        .priority = 1,
     };
+    bpf_tc_detach(&hook, &opts);
+    opts.priority = 49152;
+    bpf_tc_detach(&hook, &opts);
+    opts.handle = 0;
+    opts.priority = 0;
     bpf_tc_detach(&hook, &opts);
     bpf_tc_hook_destroy(&hook);
     return 0;
+}
+
+static bool query_tc_filter(int ifindex, uint32_t handle, uint32_t priority, uint32_t expected_prog_id) {
+    struct bpf_tc_hook hook = {
+        .sz = sizeof(hook),
+        .ifindex = ifindex,
+        .attach_point = BPF_TC_INGRESS,
+    };
+    struct bpf_tc_opts opts = {
+        .sz = sizeof(opts),
+        .handle = handle,
+        .priority = priority,
+    };
+    if (bpf_tc_query(&hook, &opts) == 0) {
+        if (expected_prog_id > 0) {
+            return opts.prog_id == expected_prog_id;
+        }
+        return true;
+    }
+    return false;
 }
 
 static bool is_tc_ingress_attached(const char *ifname, uint32_t expected_prog_id) {
@@ -301,22 +335,44 @@ static bool is_tc_ingress_attached(const char *ifname, uint32_t expected_prog_id
         return false;
     }
 
-    struct bpf_tc_hook hook = {
-        .sz = sizeof(hook),
-        .ifindex = (int)ifindex,
-        .attach_point = BPF_TC_INGRESS,
-    };
-    struct bpf_tc_opts opts = {
-        .sz = sizeof(opts),
-    };
-    if (bpf_tc_query(&hook, &opts) != 0) {
-        return false;
+    /* 1. Check fixed handle=1, priority=1 */
+    if (query_tc_filter((int)ifindex, 1, 1, expected_prog_id)) return true;
+
+    /* 2. Check kernel auto-allocated default priority 49152 (0xc000) */
+    if (query_tc_filter((int)ifindex, 1, 49152, expected_prog_id)) return true;
+
+    /* 3. Check variations of handle/priority */
+    if (query_tc_filter((int)ifindex, 0, 1, expected_prog_id)) return true;
+    if (query_tc_filter((int)ifindex, 0, 49152, expected_prog_id)) return true;
+    if (query_tc_filter((int)ifindex, 1, 0, expected_prog_id)) return true;
+    if (query_tc_filter((int)ifindex, 0, 0, expected_prog_id)) return true;
+
+    /* 4. Robust fallback via tc command inspection */
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "tc filter show dev %s ingress 2>/dev/null", ifname);
+    FILE *fp = popen(cmd, "r");
+    if (fp) {
+        char line[256];
+        bool found = false;
+        while (fgets(line, sizeof(line), fp)) {
+            if (strstr(line, "tc_router_ingress") || strstr(line, "local_router")) {
+                found = true;
+                break;
+            }
+            if (expected_prog_id > 0) {
+                char id_str[32];
+                snprintf(id_str, sizeof(id_str), "id %u", expected_prog_id);
+                if (strstr(line, id_str)) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        pclose(fp);
+        if (found) return true;
     }
 
-    if (expected_prog_id > 0) {
-        return opts.prog_id == expected_prog_id;
-    }
-    return true;
+    return false;
 }
 
 static int ensure_dir(const char *path) {
