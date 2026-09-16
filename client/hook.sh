@@ -82,7 +82,7 @@ table inet ebpf.wg.forward {
 }
 EOF
         else
-            nft -f ${DIR}/domestic.nft
+            (cd ${DIR} && nft -f ./domestic.nft)
         fi
         ip -4 route add 0.0.0.0/0 dev $WG_DEV table $FWMARK
         ip -6 route add ::/0 dev $WG_DEV table $FWMARK
