@@ -223,25 +223,11 @@ static void v4_cidr_cb(uint32_t net_be, uint32_t prefixlen, void *arg) {
     }
 }
 
-static const char *resolve_rule_path(const char *path) {
-    static char resolved[512];
-    if (access(path, R_OK) == 0) return path;
-
-    snprintf(resolved, sizeof(resolved), "src/%s", path);
-    if (access(resolved, R_OK) == 0) return resolved;
-
-    snprintf(resolved, sizeof(resolved), "./%s", path);
-    if (access(resolved, R_OK) == 0) return resolved;
-
-    return path;
-}
-
 static int apply_nft_rules(const char *rule_file, const char *wg_endpoint_str, const char *fwmark_override_str) {
-    const char *actual_file = resolve_rule_path(rule_file);
-    FILE *f = fopen(actual_file, "r");
+    FILE *f = fopen(rule_file, "r");
     if (!f) {
-        fprintf(stderr, "Error: Failed to open rule file '%s' (resolved as '%s'): %s\n",
-                rule_file, actual_file, strerror(errno));
+        fprintf(stderr, "Error: Failed to open rule file '%s': %s\n",
+                rule_file, strerror(errno));
         return -1;
     }
 
