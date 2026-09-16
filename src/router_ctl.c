@@ -12,10 +12,30 @@
 #include <sys/types.h>
 #include <arpa/inet.h>
 #include <net/if.h>
+#include <stdarg.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include "router_common.h"
 #include "local_router.skel.h"
+
+static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args) {
+    if (level == LIBBPF_DEBUG && !getenv("LIBBPF_DEBUG"))
+        return 0;
+
+    char buf[512];
+    va_list args_copy;
+    va_copy(args_copy, args);
+    vsnprintf(buf, sizeof(buf), format, args_copy);
+    va_end(args_copy);
+
+    /* "Exclusivity flag on, cannot modify" is sent via netlink extack when clsact qdisc
+     * already exists on the interface during bpf_tc_hook_create(). It is benign and expected. */
+    if (strstr(buf, "Exclusivity flag on, cannot modify")) {
+        return 0;
+    }
+
+    return vfprintf(stderr, format, args);
+}
 
 struct lan_ifaces {
     char names[MAX_LAN_IFACES][IFNAMSIZ];
@@ -1189,6 +1209,8 @@ static void print_usage(const char *prog) {
 
 #ifndef UNIT_TESTING
 int main(int argc, char **argv) {
+    libbpf_set_print(libbpf_print_fn);
+
     if (argc < 2) {
         print_usage(argv[0]);
         return 1;
