@@ -203,6 +203,63 @@ static void test_rule_parser(void) {
     printf("  [PASS] test_rule_parser\n");
 }
 
+static void test_lan_ifaces(void) {
+    struct lan_ifaces list = {0};
+
+    /* 1. Comma-separated and whitespace parsing */
+    add_lan_iface(&list, "eth1, eth2");
+    assert(list.count == 2);
+    assert(strcmp(list.names[0], "eth1") == 0);
+    assert(strcmp(list.names[1], "eth2") == 0);
+
+    /* 2. Repeated calls */
+    add_lan_iface(&list, "br0");
+    assert(list.count == 3);
+    assert(strcmp(list.names[2], "br0") == 0);
+
+    /* 3. Deduplication */
+    add_lan_iface(&list, "eth1, br0, eth3");
+    assert(list.count == 4);
+    assert(strcmp(list.names[3], "eth3") == 0);
+
+    /* 4. File persistence roundtrip */
+    const char *test_dir = "/tmp/test_lan_persist";
+    ensure_dir(test_dir);
+    save_lan_ifaces(test_dir, &list);
+
+    struct lan_ifaces loaded = {0};
+    load_lan_ifaces(test_dir, &loaded);
+    assert(loaded.count == 4);
+    assert(strcmp(loaded.names[0], "eth1") == 0);
+    assert(strcmp(loaded.names[1], "eth2") == 0);
+    assert(strcmp(loaded.names[2], "br0") == 0);
+    assert(strcmp(loaded.names[3], "eth3") == 0);
+
+    /* 5. Removal of interfaces */
+    remove_lan_iface(&list, "eth2");
+    assert(list.count == 3);
+    assert(strcmp(list.names[0], "eth1") == 0);
+    assert(strcmp(list.names[1], "br0") == 0);
+    assert(strcmp(list.names[2], "eth3") == 0);
+
+    remove_lan_iface(&list, "eth1, eth3");
+    assert(list.count == 1);
+    assert(strcmp(list.names[0], "br0") == 0);
+
+    remove_lan_iface(&list, "nonexistent");
+    assert(list.count == 1);
+
+    remove_lan_iface(&list, "br0");
+    assert(list.count == 0);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", test_dir, LAN_IFACES_FILENAME);
+    unlink(path);
+    rmdir(test_dir);
+
+    printf("  [PASS] test_lan_ifaces\n");
+}
+
 int main(void) {
     printf("[*] Running router_ctl unit tests...\n");
     test_parse_fwmark();
@@ -211,6 +268,7 @@ int main(void) {
     test_keyword_matching();
     test_ensure_dir();
     test_rule_parser();
+    test_lan_ifaces();
     printf("[✔] ALL UNIT TESTS PASSED!\n");
     return 0;
 }

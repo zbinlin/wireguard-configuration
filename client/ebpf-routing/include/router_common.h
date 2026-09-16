@@ -25,6 +25,34 @@
 #define AF_INET6 10
 #endif
 
+#ifndef TC_ACT_OK
+#define TC_ACT_OK 0
+#endif
+
+#ifndef TC_ACT_SHOT
+#define TC_ACT_SHOT 2
+#endif
+
+#ifndef ETH_P_IP
+#define ETH_P_IP 0x0800
+#endif
+
+#ifndef ETH_P_IPV6
+#define ETH_P_IPV6 0x86DD
+#endif
+
+#ifndef ETH_P_8021Q
+#define ETH_P_8021Q 0x8100
+#endif
+
+#ifndef ETH_P_8021AD
+#define ETH_P_8021AD 0x88A8
+#endif
+
+#define LAN_IFACES_FILENAME "lan_ifaces"
+#define TC_PROG_FILENAME "prog_tc_ingress"
+#define MAX_LAN_IFACES 32
+
 struct wg_endpoint {
     __u32 ip4;           /* Network byte order */
     __u32 ip6[4];        /* Network byte order */
