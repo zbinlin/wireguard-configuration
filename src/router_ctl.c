@@ -15,7 +15,7 @@
 #include <bpf/bpf.h>
 #include "local_router.skel.h"
 
-#define BPF_PIN_DIR "/sys/fs/bpf/wg_routing"
+#define DEFAULT_PIN_DIR "/sys/fs/bpf/wg_routing"
 #define DEFAULT_CGROUP_PATH "/sys/fs/cgroup"
 
 struct wg_endpoint {
@@ -62,9 +62,9 @@ static int ensure_dir(const char *path) {
     return 0;
 }
 
-static int remove_pinned(const char *name) {
+static int remove_pinned(const char *pin_dir, const char *name) {
     char path[512];
-    snprintf(path, sizeof(path), "%s/%s", BPF_PIN_DIR, name);
+    snprintf(path, sizeof(path), "%s/%s", pin_dir, name);
     if (unlink(path) != 0 && errno != ENOENT) {
         fprintf(stderr, "Warning: failed to unlink %s: %s\n", path, strerror(errno));
         return -1;
@@ -223,7 +223,7 @@ static void v4_cidr_cb(uint32_t net_be, uint32_t prefixlen, void *arg) {
     }
 }
 
-static int apply_nft_rules(const char *rule_file, const char *wg_endpoint_str, const char *fwmark_override_str) {
+static int apply_nft_rules(const char *rule_file, const char *wg_endpoint_str, const char *fwmark_override_str, const char *pin_dir) {
     FILE *f = fopen(rule_file, "r");
     if (!f) {
         fprintf(stderr, "Error: Failed to open rule file '%s': %s\n",
@@ -231,15 +231,15 @@ static int apply_nft_rules(const char *rule_file, const char *wg_endpoint_str, c
         return -1;
     }
 
-    printf("[*] Opening pinned BPF maps at %s...\n", BPF_PIN_DIR);
+    printf("[*] Opening pinned BPF maps at %s...\n", pin_dir);
     char path[512];
-    snprintf(path, sizeof(path), "%s/router_config_map", BPF_PIN_DIR);
+    snprintf(path, sizeof(path), "%s/router_config_map", pin_dir);
     int cfg_fd = bpf_obj_get(path);
-    snprintf(path, sizeof(path), "%s/wg_endpoint_map", BPF_PIN_DIR);
+    snprintf(path, sizeof(path), "%s/wg_endpoint_map", pin_dir);
     int ep_fd = bpf_obj_get(path);
-    snprintf(path, sizeof(path), "%s/bypass_v4_map", BPF_PIN_DIR);
+    snprintf(path, sizeof(path), "%s/bypass_v4_map", pin_dir);
     int v4_fd = bpf_obj_get(path);
-    snprintf(path, sizeof(path), "%s/bypass_v6_map", BPF_PIN_DIR);
+    snprintf(path, sizeof(path), "%s/bypass_v6_map", pin_dir);
     int v6_fd = bpf_obj_get(path);
 
     if (cfg_fd < 0 || ep_fd < 0 || v4_fd < 0 || v6_fd < 0) {
@@ -392,30 +392,31 @@ static int apply_nft_rules(const char *rule_file, const char *wg_endpoint_str, c
     return 0;
 }
 
-static int do_stop(void) {
-    printf("[*] Stopping eBPF router and cleaning up pinned objects...\n");
-    remove_pinned("link_connect4");
-    remove_pinned("link_sendmsg4");
-    remove_pinned("link_connect6");
-    remove_pinned("link_sendmsg6");
+static int do_stop(const char *pin_dir) {
+    printf("[*] Stopping eBPF router and cleaning up pinned objects at %s...\n", pin_dir);
+    remove_pinned(pin_dir, "link_connect4");
+    remove_pinned(pin_dir, "link_sendmsg4");
+    remove_pinned(pin_dir, "link_connect6");
+    remove_pinned(pin_dir, "link_sendmsg6");
 
-    remove_pinned("wg_endpoint_map");
-    remove_pinned("bypass_v4_map");
-    remove_pinned("bypass_v6_map");
-    remove_pinned("router_config_map");
+    remove_pinned(pin_dir, "wg_endpoint_map");
+    remove_pinned(pin_dir, "bypass_v4_map");
+    remove_pinned(pin_dir, "bypass_v6_map");
+    remove_pinned(pin_dir, "router_config_map");
 
-    rmdir(BPF_PIN_DIR);
+    rmdir(pin_dir);
     printf("[✔] Successfully stopped and unpinned.\n");
     return 0;
 }
 
-static int do_start(const char *cgroup_path, const char *rule_file, const char *wg_endpoint, const char *fwmark) {
+static int do_start(const char *cgroup_path, const char *rule_file, const char *wg_endpoint, const char *fwmark, const char *pin_dir) {
     if (!rule_file) {
         fprintf(stderr, "Error: --rule-file is required for start.\n");
         return 1;
     }
 
     if (!cgroup_path) cgroup_path = DEFAULT_CGROUP_PATH;
+    if (!pin_dir) pin_dir = DEFAULT_PIN_DIR;
 
     int cgroup_fd = open(cgroup_path, O_RDONLY | O_DIRECTORY);
     if (cgroup_fd < 0) {
@@ -423,21 +424,21 @@ static int do_start(const char *cgroup_path, const char *rule_file, const char *
         return 1;
     }
 
-    if (ensure_dir(BPF_PIN_DIR) != 0) {
-        fprintf(stderr, "Error: Failed to create bpffs dir %s: %s\n", BPF_PIN_DIR, strerror(errno));
+    if (ensure_dir(pin_dir) != 0) {
+        fprintf(stderr, "Error: Failed to create bpffs dir %s: %s\n", pin_dir, strerror(errno));
         close(cgroup_fd);
         return 1;
     }
 
     /* Clean up any leftover pinned objects from previous runs */
-    remove_pinned("link_connect4");
-    remove_pinned("link_sendmsg4");
-    remove_pinned("link_connect6");
-    remove_pinned("link_sendmsg6");
-    remove_pinned("wg_endpoint_map");
-    remove_pinned("bypass_v4_map");
-    remove_pinned("bypass_v6_map");
-    remove_pinned("router_config_map");
+    remove_pinned(pin_dir, "link_connect4");
+    remove_pinned(pin_dir, "link_sendmsg4");
+    remove_pinned(pin_dir, "link_connect6");
+    remove_pinned(pin_dir, "link_sendmsg6");
+    remove_pinned(pin_dir, "wg_endpoint_map");
+    remove_pinned(pin_dir, "bypass_v4_map");
+    remove_pinned(pin_dir, "bypass_v6_map");
+    remove_pinned(pin_dir, "router_config_map");
 
     /* Also clean up any accidental root bpffs pins from earlier versions */
     unlink("/sys/fs/bpf/wg_endpoint_map");
@@ -458,7 +459,7 @@ static int do_start(const char *cgroup_path, const char *rule_file, const char *
         goto cleanup;
     }
 
-    err = bpf_object__pin_maps(skel->obj, BPF_PIN_DIR);
+    err = bpf_object__pin_maps(skel->obj, pin_dir);
     if (err && err != -EEXIST) {
         fprintf(stderr, "Error: Failed to pin maps: %d\n", err);
         goto cleanup;
@@ -471,7 +472,7 @@ static int do_start(const char *cgroup_path, const char *rule_file, const char *
         err = -errno;
         goto cleanup;
     }
-    snprintf(link_path, sizeof(link_path), "%s/link_connect4", BPF_PIN_DIR);
+    snprintf(link_path, sizeof(link_path), "%s/link_connect4", pin_dir);
     bpf_link__pin(skel->links.sock_connect4, link_path);
 
     skel->links.sock_sendmsg4 = bpf_program__attach_cgroup(skel->progs.sock_sendmsg4, cgroup_fd);
@@ -480,7 +481,7 @@ static int do_start(const char *cgroup_path, const char *rule_file, const char *
         err = -errno;
         goto cleanup;
     }
-    snprintf(link_path, sizeof(link_path), "%s/link_sendmsg4", BPF_PIN_DIR);
+    snprintf(link_path, sizeof(link_path), "%s/link_sendmsg4", pin_dir);
     bpf_link__pin(skel->links.sock_sendmsg4, link_path);
 
     skel->links.sock_connect6 = bpf_program__attach_cgroup(skel->progs.sock_connect6, cgroup_fd);
@@ -489,7 +490,7 @@ static int do_start(const char *cgroup_path, const char *rule_file, const char *
         err = -errno;
         goto cleanup;
     }
-    snprintf(link_path, sizeof(link_path), "%s/link_connect6", BPF_PIN_DIR);
+    snprintf(link_path, sizeof(link_path), "%s/link_connect6", pin_dir);
     bpf_link__pin(skel->links.sock_connect6, link_path);
 
     skel->links.sock_sendmsg6 = bpf_program__attach_cgroup(skel->progs.sock_sendmsg6, cgroup_fd);
@@ -498,13 +499,13 @@ static int do_start(const char *cgroup_path, const char *rule_file, const char *
         err = -errno;
         goto cleanup;
     }
-    snprintf(link_path, sizeof(link_path), "%s/link_sendmsg6", BPF_PIN_DIR);
+    snprintf(link_path, sizeof(link_path), "%s/link_sendmsg6", pin_dir);
     bpf_link__pin(skel->links.sock_sendmsg6, link_path);
 
     printf("[+] Successfully loaded and attached eBPF programs to cgroup '%s'!\n", cgroup_path);
 
     /* Apply rules */
-    err = apply_nft_rules(rule_file, wg_endpoint, fwmark);
+    err = apply_nft_rules(rule_file, wg_endpoint, fwmark, pin_dir);
 
 cleanup:
     close(cgroup_fd);
@@ -512,12 +513,13 @@ cleanup:
     return err ? 1 : 0;
 }
 
-static int do_set_endpoint(const char *endpoint_str) {
+static int do_set_endpoint(const char *endpoint_str, const char *pin_dir) {
+    if (!pin_dir) pin_dir = DEFAULT_PIN_DIR;
     char path[512];
-    snprintf(path, sizeof(path), "%s/wg_endpoint_map", BPF_PIN_DIR);
+    snprintf(path, sizeof(path), "%s/wg_endpoint_map", pin_dir);
     int ep_fd = bpf_obj_get(path);
     if (ep_fd < 0) {
-        fprintf(stderr, "Error: Failed to open wg_endpoint_map. Is the router loaded?\n");
+        fprintf(stderr, "Error: Failed to open wg_endpoint_map at %s. Is the router loaded?\n", pin_dir);
         return 1;
     }
 
@@ -538,17 +540,18 @@ static int do_set_endpoint(const char *endpoint_str) {
     return 0;
 }
 
-static int do_status(void) {
-    if (access(BPF_PIN_DIR, F_OK) != 0) {
-        printf("[!] eBPF router is NOT running (Pinned directory %s does not exist).\n", BPF_PIN_DIR);
+static int do_status(const char *pin_dir) {
+    if (!pin_dir) pin_dir = DEFAULT_PIN_DIR;
+    if (access(pin_dir, F_OK) != 0) {
+        printf("[!] eBPF router is NOT running (Pinned directory %s does not exist).\n", pin_dir);
         return 0;
     }
 
     printf("[+] eBPF Router Status:\n");
-    printf("  Pinned Directory: %s\n", BPF_PIN_DIR);
+    printf("  Pinned Directory: %s\n", pin_dir);
 
     char path[512];
-    snprintf(path, sizeof(path), "%s/router_config_map", BPF_PIN_DIR);
+    snprintf(path, sizeof(path), "%s/router_config_map", pin_dir);
     int cfg_fd = bpf_obj_get(path);
     if (cfg_fd >= 0) {
         uint32_t zero = 0;
@@ -559,7 +562,7 @@ static int do_status(void) {
         close(cfg_fd);
     }
 
-    snprintf(path, sizeof(path), "%s/wg_endpoint_map", BPF_PIN_DIR);
+    snprintf(path, sizeof(path), "%s/wg_endpoint_map", pin_dir);
     int ep_fd = bpf_obj_get(path);
     if (ep_fd >= 0) {
         uint32_t zero = 0;
@@ -591,14 +594,14 @@ static int do_status(void) {
         close(ep_fd);
     }
 
-    snprintf(path, sizeof(path), "%s/bypass_v4_map", BPF_PIN_DIR);
+    snprintf(path, sizeof(path), "%s/bypass_v4_map", pin_dir);
     int v4_fd = bpf_obj_get(path);
     if (v4_fd >= 0) {
         printf("  Bypass IPv4 CIDRs in kernel map: %d\n", count_map_keys(v4_fd));
         close(v4_fd);
     }
 
-    snprintf(path, sizeof(path), "%s/bypass_v6_map", BPF_PIN_DIR);
+    snprintf(path, sizeof(path), "%s/bypass_v6_map", pin_dir);
     int v6_fd = bpf_obj_get(path);
     if (v6_fd >= 0) {
         printf("  Bypass IPv6 CIDRs in kernel map: %d\n", count_map_keys(v6_fd));
@@ -613,16 +616,22 @@ static void print_usage(const char *prog) {
     printf("Commands:\n");
     printf("  start          Load eBPF, attach to cgroup, and apply nftables rules\n");
     printf("                 Options: --cgroup-path <path>    (default: /sys/fs/cgroup)\n");
+    printf("                          --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n");
     printf("                          --wg-endpoint <IP[:Port]>\n");
     printf("                          --rule-file <var.nft>   (required)\n");
     printf("                          --fwmark <mark>         (optional override)\n\n");
-    printf("  stop           Detach eBPF programs and remove pinned objects\n\n");
+    printf("  stop           Detach eBPF programs and remove pinned objects\n");
+    printf("                 Options: --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n\n");
     printf("  reload         Hot-reload nftables rule file into BPF maps (no detach)\n");
     printf("                 Options: --rule-file <var.nft>   (required)\n");
+    printf("                          --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n");
     printf("                          --wg-endpoint <IP[:Port]>\n");
     printf("                          --fwmark <mark>\n\n");
-    printf("  set-endpoint   Dynamically update WireGuard endpoint (IP[:Port])\n\n");
+    printf("  set-endpoint   Dynamically update WireGuard endpoint (IP[:Port])\n");
+    printf("                 Options: --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n");
+    printf("                 Usage:   %s set-endpoint <IP[:Port]> [--pin-dir <path>]\n\n", prog);
     printf("  status         Show current eBPF router status and map statistics\n");
+    printf("                 Options: --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n");
 }
 
 int main(int argc, char **argv) {
@@ -632,6 +641,7 @@ int main(int argc, char **argv) {
     }
 
     const char *cmd = argv[1];
+    const char *pin_dir = DEFAULT_PIN_DIR;
 
     if (strcmp(cmd, "start") == 0 || strcmp(cmd, "load") == 0) {
         const char *cgroup_path = DEFAULT_CGROUP_PATH;
@@ -642,6 +652,8 @@ int main(int argc, char **argv) {
         for (int i = 2; i < argc; i++) {
             if (strcmp(argv[i], "--cgroup-path") == 0 && i + 1 < argc) {
                 cgroup_path = argv[++i];
+            } else if (strcmp(argv[i], "--pin-dir") == 0 && i + 1 < argc) {
+                pin_dir = argv[++i];
             } else if (strcmp(argv[i], "--rule-file") == 0 && i + 1 < argc) {
                 rule_file = argv[++i];
             } else if (strcmp(argv[i], "--wg-endpoint") == 0 && i + 1 < argc) {
@@ -654,9 +666,18 @@ int main(int argc, char **argv) {
                 return 1;
             }
         }
-        return do_start(cgroup_path, rule_file, wg_endpoint, fwmark);
+        return do_start(cgroup_path, rule_file, wg_endpoint, fwmark, pin_dir);
     } else if (strcmp(cmd, "stop") == 0 || strcmp(cmd, "unload") == 0) {
-        return do_stop();
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--pin-dir") == 0 && i + 1 < argc) {
+                pin_dir = argv[++i];
+            } else {
+                fprintf(stderr, "Unknown argument '%s'\n", argv[i]);
+                print_usage(argv[0]);
+                return 1;
+            }
+        }
+        return do_stop(pin_dir);
     } else if (strcmp(cmd, "reload") == 0 || strcmp(cmd, "apply") == 0) {
         const char *rule_file = NULL;
         const char *wg_endpoint = NULL;
@@ -665,6 +686,8 @@ int main(int argc, char **argv) {
         for (int i = 2; i < argc; i++) {
             if (strcmp(argv[i], "--rule-file") == 0 && i + 1 < argc) {
                 rule_file = argv[++i];
+            } else if (strcmp(argv[i], "--pin-dir") == 0 && i + 1 < argc) {
+                pin_dir = argv[++i];
             } else if (strcmp(argv[i], "--wg-endpoint") == 0 && i + 1 < argc) {
                 wg_endpoint = argv[++i];
             } else if (strcmp(argv[i], "--fwmark") == 0 && i + 1 < argc) {
@@ -679,15 +702,36 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Error: --rule-file is required for reload.\n");
             return 1;
         }
-        return apply_nft_rules(rule_file, wg_endpoint, fwmark);
+        return apply_nft_rules(rule_file, wg_endpoint, fwmark, pin_dir);
     } else if (strcmp(cmd, "set-endpoint") == 0) {
-        if (argc < 3) {
-            fprintf(stderr, "Error: missing endpoint argument. Usage: %s set-endpoint <IP:Port>\n", argv[0]);
+        const char *ep_str = NULL;
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--pin-dir") == 0 && i + 1 < argc) {
+                pin_dir = argv[++i];
+            } else if (!ep_str && argv[i][0] != '-') {
+                ep_str = argv[i];
+            } else {
+                fprintf(stderr, "Unknown argument '%s'\n", argv[i]);
+                print_usage(argv[0]);
+                return 1;
+            }
+        }
+        if (!ep_str) {
+            fprintf(stderr, "Error: missing endpoint argument. Usage: %s set-endpoint <IP[:Port]> [--pin-dir <path>]\n", argv[0]);
             return 1;
         }
-        return do_set_endpoint(argv[2]);
+        return do_set_endpoint(ep_str, pin_dir);
     } else if (strcmp(cmd, "status") == 0) {
-        return do_status();
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--pin-dir") == 0 && i + 1 < argc) {
+                pin_dir = argv[++i];
+            } else {
+                fprintf(stderr, "Unknown argument '%s'\n", argv[i]);
+                print_usage(argv[0]);
+                return 1;
+            }
+        }
+        return do_status(pin_dir);
     } else {
         fprintf(stderr, "Unknown command '%s'\n", cmd);
         print_usage(argv[0]);

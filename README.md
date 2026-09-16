@@ -81,6 +81,7 @@ sudo ./router-ctl.sh start \
 
 参数说明：
 - `--cgroup-path <path>`：cgroup v2 挂载路径（默认 `/sys/fs/cgroup`）。
+- `--pin-dir <path>`：（可选）BPF 对象持久化 Pin 目录（默认 `/sys/fs/bpf/wg_routing`）。
 - `--wg-endpoint <IP[:Port]>`：WireGuard 服务端地址（防死锁回环）。
   - 支持带端口：如 `198.51.100.1:51820` 或 `[2001:db8::1]:51820`（仅匹配指定端口）。
   - **支持不带端口**：如 `198.51.100.1` 或 `2001:db8::1`（匹配该 IP 的所有端口全部放行直连）。
