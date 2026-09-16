@@ -10,6 +10,7 @@
 #include <ctype.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <stdarg.h>
@@ -70,16 +71,19 @@ static void add_lan_iface(struct lan_ifaces *list, const char *arg) {
     while (tok) {
         char *name = trim(tok);
         if (*name) {
+            char clean_name[IFNAMSIZ];
+            strncpy(clean_name, name, sizeof(clean_name) - 1);
+            clean_name[sizeof(clean_name) - 1] = '\0';
+
             bool exists = false;
             for (int i = 0; i < list->count; i++) {
-                if (strcmp(list->names[i], name) == 0) {
+                if (strcmp(list->names[i], clean_name) == 0) {
                     exists = true;
                     break;
                 }
             }
             if (!exists && list->count < MAX_LAN_IFACES) {
-                strncpy(list->names[list->count], name, IFNAMSIZ - 1);
-                list->names[list->count][IFNAMSIZ - 1] = '\0';
+                memcpy(list->names[list->count], clean_name, IFNAMSIZ);
                 list->count++;
             }
         }
@@ -97,8 +101,12 @@ static void remove_lan_iface(struct lan_ifaces *list, const char *arg) {
     while (tok) {
         char *name = trim(tok);
         if (*name) {
+            char clean_name[IFNAMSIZ];
+            strncpy(clean_name, name, sizeof(clean_name) - 1);
+            clean_name[sizeof(clean_name) - 1] = '\0';
+
             for (int i = 0; i < list->count; i++) {
-                if (strcmp(list->names[i], name) == 0) {
+                if (strcmp(list->names[i], clean_name) == 0) {
                     for (int j = i; j < list->count - 1; j++) {
                         memcpy(list->names[j], list->names[j + 1], IFNAMSIZ);
                     }
@@ -315,7 +323,9 @@ static int tc_detach_interface(const char *ifname) {
     opts.handle = 0;
     opts.priority = 0;
     bpf_tc_detach(&hook, &opts);
-    bpf_tc_hook_destroy(&hook);
+    /* Note: We intentionally do NOT call bpf_tc_hook_destroy(&hook) here,
+     * to avoid collaterally removing other TC filters or qdisc configurations
+     * (e.g. QoS, egress filters) sharing the interface's clsact qdisc. */
     g_suppress_libbpf_log = false;
     return 0;
 }
@@ -343,6 +353,61 @@ static bool query_tc_filter(int ifindex, uint32_t handle, uint32_t priority, uin
     return false;
 }
 
+static bool check_tc_filter_cmd(const char *ifname, uint32_t expected_prog_id) {
+    int pipefd[2];
+    if (pipe(pipefd) != 0) return false;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return false;
+    }
+
+    if (pid == 0) {
+        /* Child process: direct exec without shell to prevent command injection */
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[1]);
+        int nullfd = open("/dev/null", O_WRONLY);
+        if (nullfd >= 0) {
+            dup2(nullfd, STDERR_FILENO);
+            close(nullfd);
+        }
+        char *const argv[] = {"tc", "filter", "show", "dev", (char *)ifname, "ingress", NULL};
+        execvp("tc", argv);
+        _exit(127);
+    }
+
+    /* Parent process */
+    close(pipefd[1]);
+    FILE *fp = fdopen(pipefd[0], "r");
+    bool found = false;
+    if (fp) {
+        char line[256];
+        char id_str[32] = {0};
+        if (expected_prog_id > 0) {
+            snprintf(id_str, sizeof(id_str), "id %u", expected_prog_id);
+        }
+        while (fgets(line, sizeof(line), fp)) {
+            if (strstr(line, "tc_router_ingress") || strstr(line, "local_router")) {
+                found = true;
+                break;
+            }
+            if (expected_prog_id > 0 && strstr(line, id_str)) {
+                found = true;
+                break;
+            }
+        }
+        fclose(fp);
+    } else {
+        close(pipefd[0]);
+    }
+    int status;
+    waitpid(pid, &status, 0);
+    return found;
+}
+
 static bool is_tc_ingress_attached(const char *ifname, uint32_t expected_prog_id) {
     unsigned int ifindex = if_nametoindex(ifname);
     if (ifindex == 0) {
@@ -361,32 +426,8 @@ static bool is_tc_ingress_attached(const char *ifname, uint32_t expected_prog_id
     if (query_tc_filter((int)ifindex, 1, 0, expected_prog_id)) return true;
     if (query_tc_filter((int)ifindex, 0, 0, expected_prog_id)) return true;
 
-    /* 4. Robust fallback via tc command inspection */
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "tc filter show dev %s ingress 2>/dev/null", ifname);
-    FILE *fp = popen(cmd, "r");
-    if (fp) {
-        char line[256];
-        bool found = false;
-        while (fgets(line, sizeof(line), fp)) {
-            if (strstr(line, "tc_router_ingress") || strstr(line, "local_router")) {
-                found = true;
-                break;
-            }
-            if (expected_prog_id > 0) {
-                char id_str[32];
-                snprintf(id_str, sizeof(id_str), "id %u", expected_prog_id);
-                if (strstr(line, id_str)) {
-                    found = true;
-                    break;
-                }
-            }
-        }
-        pclose(fp);
-        if (found) return true;
-    }
-
-    return false;
+    /* 4. Robust fallback via direct tc command inspection without shell */
+    return check_tc_filter_cmd(ifname, expected_prog_id);
 }
 
 static int ensure_dir(const char *path) {
@@ -1021,7 +1062,15 @@ static int apply_nft_rules(const char *rule_file, const char *wg_endpoint_str, c
     }
 
     printf("  -> Loaded %d IPv4 CIDR rules into bypass_v4_map (including decomposed ranges)\n", v4_loaded);
+    if (v4_loaded < (int)rc.v4_count) {
+        fprintf(stderr, "Warning: %d of %zu IPv4 bypass rules could not be loaded into bypass_v4_map (map capacity reached?)\n",
+                (int)rc.v4_count - v4_loaded, rc.v4_count);
+    }
     printf("  -> Loaded %d IPv6 CIDR rules into bypass_v6_map\n", v6_loaded);
+    if (v6_loaded < (int)rc.v6_count) {
+        fprintf(stderr, "Warning: %d of %zu IPv6 bypass rules could not be loaded into bypass_v6_map (map capacity reached?)\n",
+                (int)rc.v6_count - v6_loaded, rc.v6_count);
+    }
     printf("[✔] Successfully applied all routing rules!\n");
 
     close(cfg_fd);

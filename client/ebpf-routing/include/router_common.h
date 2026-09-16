@@ -29,10 +29,6 @@
 #define TC_ACT_OK 0
 #endif
 
-#ifndef TC_ACT_SHOT
-#define TC_ACT_SHOT 2
-#endif
-
 #ifndef ETH_P_IP
 #define ETH_P_IP 0x0800
 #endif
