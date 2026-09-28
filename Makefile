@@ -23,10 +23,10 @@ $(BUILD_DIR)/local_router.skel.h: $(BUILD_DIR)/local_router.bpf.o | $(BUILD_DIR)
 	$(BPFTOOL) gen skeleton $< > $@
 
 $(BUILD_DIR)/router_ctl: src/router_ctl.c include/router_common.h $(BUILD_DIR)/local_router.skel.h | $(BUILD_DIR)
-	$(GCC) -O2 -Iinclude -I$(BUILD_DIR) -Isrc -I. $< $(LDFLAGS) -o $@
+	$(GCC) -O2 -Wall -Wextra -Iinclude -I$(BUILD_DIR) -Isrc -I. $< $(LDFLAGS) -o $@
 
 $(BUILD_DIR)/test_router_ctl: tests/test_router_ctl.c src/router_ctl.c include/router_common.h $(BUILD_DIR)/local_router.skel.h | $(BUILD_DIR)
-	$(GCC) -O2 -Iinclude -I$(BUILD_DIR) -Isrc -I. $< $(LDFLAGS) -o $@
+	$(GCC) -O2 -Wall -Wextra -Iinclude -I$(BUILD_DIR) -Isrc -I. $< $(LDFLAGS) -o $@
 
 test: $(BUILD_DIR)/test_router_ctl
 	./$(BUILD_DIR)/test_router_ctl

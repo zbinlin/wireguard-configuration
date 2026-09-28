@@ -269,6 +269,40 @@ static void test_lan_ifaces(void) {
     printf("  [PASS] test_lan_ifaces\n");
 }
 
+static void test_oif_resolution(void) {
+    uint32_t ip4 = 0;
+    uint32_t ip6[4] = {0};
+
+    /* 1. Test existing interface (loopback 'lo' is always present on Linux) */
+    assert(get_interface_ips("lo", &ip4, ip6) == 0);
+    assert(ip4 == htonl(0x7F000001)); /* 127.0.0.1 */
+
+    /* 2. Test non-existent interface */
+    assert(get_interface_ips("nonexistent_dev_xyz", &ip4, ip6) == -1);
+    assert(ip4 == 0);
+    assert(ip6[0] == 0 && ip6[1] == 0 && ip6[2] == 0 && ip6[3] == 0);
+
+    /* 3. Test router_config simulation (set-oif and del-oif logic) */
+    struct router_config cfg = {
+        .fwmark = 0x3000,
+        .enabled = 1,
+        .oif_src_ip4 = 0,
+        .oif_src_ip6 = {0},
+    };
+
+    /* Simulate set-oif on 'lo' */
+    assert(get_interface_ips("lo", &cfg.oif_src_ip4, cfg.oif_src_ip6) == 0);
+    assert(cfg.oif_src_ip4 == htonl(0x7F000001));
+
+    /* Simulate del-oif */
+    cfg.oif_src_ip4 = 0;
+    memset(cfg.oif_src_ip6, 0, sizeof(cfg.oif_src_ip6));
+    assert(cfg.oif_src_ip4 == 0);
+    assert(cfg.oif_src_ip6[0] == 0 && cfg.oif_src_ip6[3] == 0);
+
+    printf(" [PASS] test_oif_resolution\n");
+}
+
 int main(void) {
     printf("[*] Running router_ctl unit tests...\n");
     test_parse_fwmark();
@@ -278,6 +312,7 @@ int main(void) {
     test_ensure_dir();
     test_rule_parser();
     test_lan_ifaces();
+    test_oif_resolution();
     printf("[✔] ALL UNIT TESTS PASSED!\n");
     return 0;
 }
