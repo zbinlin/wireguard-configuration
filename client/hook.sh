@@ -71,7 +71,8 @@ case $1 in
                 --cgroup-path /sys/fs/cgroup \
                 --pin-dir /sys/fs/bpf/wg_routing \
                 --wg-endpoint $ENDPOINT \
-                --rule-file ${DIR}/data/var.nft
+                --rule-file ${DIR}/data/var.nft \
+                --wg-dev ${WG_DEV}
             nft -f - <<EOF
 destroy table inet ebpf.wg.forward;
 table inet ebpf.wg.forward {
