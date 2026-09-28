@@ -532,6 +532,30 @@ static void test_ipv4_mapped_ipv6_logic(void) {
     printf("  [PASS] test_ipv4_mapped_ipv6_logic\n");
 }
 
+static void test_iif_oif_cli_alignment(void) {
+    /* Verify iif and oif naming conventions and lan_ifaces manipulation */
+    struct lan_ifaces iif_list = {0};
+
+    /* Verify adding iif */
+    add_lan_iface(&iif_list, "eth1");
+    add_lan_iface(&iif_list, "eth2,eth3");
+    assert(iif_list.count == 3);
+    assert(strcmp(iif_list.names[0], "eth1") == 0);
+    assert(strcmp(iif_list.names[1], "eth2") == 0);
+    assert(strcmp(iif_list.names[2], "eth3") == 0);
+
+    /* Verify removing iif */
+    remove_lan_iface(&iif_list, "eth2");
+    assert(iif_list.count == 2);
+    assert(strcmp(iif_list.names[0], "eth1") == 0);
+    assert(strcmp(iif_list.names[1], "eth3") == 0);
+
+    remove_lan_iface(&iif_list, "eth1,eth3");
+    assert(iif_list.count == 0);
+
+    printf("  [PASS] test_iif_oif_cli_alignment\n");
+}
+
 int main(void) {
     printf("[*] Running router_ctl unit tests...\n");
     test_parse_fwmark();
@@ -547,6 +571,7 @@ int main(void) {
     test_qinq_ethertypes();
     test_prune_lpm_algorithm();
     test_ipv4_mapped_ipv6_logic();
+    test_iif_oif_cli_alignment();
     printf("[✔] ALL UNIT TESTS PASSED!\n");
     return 0;
 }

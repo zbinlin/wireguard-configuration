@@ -34,7 +34,7 @@ struct {
     __type(value, struct router_config);
 } router_config_map SEC(".maps");
 
-/* Pinned map used for userspace LAN interface bookkeeping (status/add-if/del-if);
+/* Pinned map used for userspace LAN interface bookkeeping (status/add-iif/del-iif);
  * not accessed in-kernel by packet processing logic. */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);

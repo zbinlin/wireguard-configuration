@@ -1754,7 +1754,7 @@ static int do_status(const char *pin_dir) {
     }
 
     if (lan_list.count > 0) {
-        printf("  LAN Interfaces (TC Ingress Forwarding):\n");
+        printf("  Inbound Interfaces (iif / TC Ingress Forwarding):\n");
         for (int i = 0; i < lan_list.count; i++) {
             const char *name = lan_list.names[i];
             unsigned int ifidx = if_nametoindex(name);
@@ -1763,12 +1763,12 @@ static int do_status(const char *pin_dir) {
             } else if (is_tc_ingress_attached(name, our_prog_id)) {
                 printf("    - %-12s: [ACTIVE] (ifindex %u, TC ingress filter active)\n", name, ifidx);
             } else {
-                printf("    - %-12s: [DETACHED / RECREATED] (ifindex %u, filter missing - run 'add-if %s' to reattach)\n",
+                printf("    - %-12s: [DETACHED / RECREATED] (ifindex %u, filter missing - run 'add-iif %s' to reattach)\n",
                        name, ifidx, name);
             }
         }
     } else {
-        printf("  LAN Interfaces (TC Ingress): None (Local-only mode)\n");
+        printf("  Inbound Interfaces (iif / TC Ingress): None (Local-only mode)\n");
     }
 
     char path[512];
@@ -1844,7 +1844,7 @@ static int do_status(const char *pin_dir) {
 }
 
 static void print_usage(const char *prog) {
-    printf("Usage: %s <start|stop|reload|set-endpoint|del-endpoint|set-oif|del-oif|add-if|del-if|status> [options]\n\n", prog);
+    printf("Usage: %s <start|stop|reload|set-endpoint|del-endpoint|set-oif|del-oif|add-iif|del-iif|status> [options]\n\n", prog);
     printf("Commands:\n");
     printf("  start          Load eBPF, attach to cgroup and optional LAN interfaces, and apply rules\n");
     printf("                 Options: --cgroup-path <path>    (default: /sys/fs/cgroup)\n");
@@ -1853,11 +1853,12 @@ static void print_usage(const char *prog) {
     printf("                          --rule-file <var.nft>   (required)\n");
     printf("                          --fwmark <mark>         (optional override)\n");
     printf("                          --oif <iface>           (optional outbound interface to bind UDP source IP, e.g. wg0)\n");
-    printf("                          --lan-if <iface>        (optional LAN interfaces for TC ingress,\n");
-    printf("                                                   can be repeated or comma-separated, e.g. eth1,eth2)\n\n");
+    printf("                          --iif <iface>           (optional inbound/LAN interfaces for TC ingress,\n");
+    printf("                                                   can be repeated or comma-separated, e.g. eth1,eth2;\n");
+    printf("                                                   alias: --lan-if)\n\n");
     printf("  stop           Detach eBPF programs, TC ingress filters, and remove pinned objects\n");
     printf("                 Options: --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n");
-    printf("                          --lan-if <iface>        (optional explicit LAN interfaces to detach)\n\n");
+    printf("                          --iif <iface>           (optional explicit inbound/LAN interfaces to detach; alias: --lan-if)\n\n");
     printf("  reload         Hot-reload nftables rule file into BPF maps (no detach)\n");
     printf("                 Options: --rule-file <var.nft>   (required)\n");
     printf("                          --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n");
@@ -1876,12 +1877,12 @@ static void print_usage(const char *prog) {
     printf("  del-oif        Dynamically remove outbound interface (oif) and disable source IP injection\n");
     printf("                 Options: --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n");
     printf("                 Usage:   %s del-oif [--pin-dir <path>]\n\n", prog);
-    printf("  add-if         Dynamically attach TC ingress filter to LAN interface(s)\n");
+    printf("  add-iif        Dynamically attach TC ingress filter to inbound/LAN interface(s) (alias: add-if)\n");
     printf("                 Options: --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n");
-    printf("                 Usage:   %s add-if <iface[,iface2]> [--pin-dir <path>]\n\n", prog);
-    printf("  del-if         Dynamically detach TC ingress filter from LAN interface(s)\n");
+    printf("                 Usage:   %s add-iif <iface[,iface2]> [--pin-dir <path>]\n\n", prog);
+    printf("  del-iif        Dynamically detach TC ingress filter from inbound/LAN interface(s) (alias: del-if)\n");
     printf("                 Options: --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n");
-    printf("                 Usage:   %s del-if <iface[,iface2]> [--pin-dir <path>]\n\n", prog);
+    printf("                 Usage:   %s del-iif <iface[,iface2]> [--pin-dir <path>]\n\n", prog);
     printf("  status         Show current eBPF router status, LAN interfaces, and map statistics\n");
     printf("                 Options: --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n");
     printf("                 Usage:   %s status [--pin-dir <path>]\n", prog);
@@ -1926,7 +1927,7 @@ int main(int argc, char **argv) {
             } else if (strcmp(argv[i], "--oif") == 0 || strcmp(argv[i], "--egress-dev") == 0 || strcmp(argv[i], "--wg-dev") == 0) {
                 if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 oif_dev = argv[++i];
-            } else if (strcmp(argv[i], "--lan-if") == 0 || strcmp(argv[i], "--forward-if") == 0 ||
+            } else if (strcmp(argv[i], "--iif") == 0 || strcmp(argv[i], "--lan-if") == 0 || strcmp(argv[i], "--forward-if") == 0 ||
                        strcmp(argv[i], "--lan-interface") == 0) {
                 if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 add_lan_iface(&lan_list, argv[++i]);
@@ -1943,7 +1944,7 @@ int main(int argc, char **argv) {
             if (strcmp(argv[i], "--pin-dir") == 0) {
                 if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 pin_dir = argv[++i];
-            } else if (strcmp(argv[i], "--lan-if") == 0 || strcmp(argv[i], "--forward-if") == 0 ||
+            } else if (strcmp(argv[i], "--iif") == 0 || strcmp(argv[i], "--lan-if") == 0 || strcmp(argv[i], "--forward-if") == 0 ||
                        strcmp(argv[i], "--lan-interface") == 0) {
                 if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 add_lan_iface(&cli_lan, argv[++i]);
@@ -2059,13 +2060,14 @@ int main(int argc, char **argv) {
             }
         }
         return do_del_oif(pin_dir);
-    } else if (strcmp(cmd, "add-if") == 0 || strcmp(cmd, "add-lan-if") == 0) {
+    } else if (strcmp(cmd, "add-iif") == 0 || strcmp(cmd, "add-if") == 0 ||
+               strcmp(cmd, "set-iif") == 0 || strcmp(cmd, "add-lan-if") == 0) {
         const char *if_str = NULL;
         for (int i = 2; i < argc; i++) {
             if (strcmp(argv[i], "--pin-dir") == 0) {
                 if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 pin_dir = argv[++i];
-            } else if (strcmp(argv[i], "--lan-if") == 0 || strcmp(argv[i], "--if") == 0) {
+            } else if (strcmp(argv[i], "--iif") == 0 || strcmp(argv[i], "--lan-if") == 0 || strcmp(argv[i], "--if") == 0) {
                 if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 if_str = argv[++i];
             } else if (!if_str && argv[i][0] != '-') {
@@ -2077,17 +2079,18 @@ int main(int argc, char **argv) {
             }
         }
         if (!if_str) {
-            fprintf(stderr, "Error: missing interface argument. Usage: %s add-if <iface[,iface2]> [--pin-dir <path>]\n", argv[0]);
+            fprintf(stderr, "Error: missing interface argument. Usage: %s add-iif <iface[,iface2]> [--pin-dir <path>]\n", argv[0]);
             return 1;
         }
         return do_add_iif(if_str, pin_dir);
-    } else if (strcmp(cmd, "del-if") == 0 || strcmp(cmd, "del-lan-if") == 0 || strcmp(cmd, "remove-if") == 0) {
+    } else if (strcmp(cmd, "del-iif") == 0 || strcmp(cmd, "del-if") == 0 ||
+               strcmp(cmd, "unset-iif") == 0 || strcmp(cmd, "del-lan-if") == 0 || strcmp(cmd, "remove-if") == 0) {
         const char *if_str = NULL;
         for (int i = 2; i < argc; i++) {
             if (strcmp(argv[i], "--pin-dir") == 0) {
                 if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 pin_dir = argv[++i];
-            } else if (strcmp(argv[i], "--lan-if") == 0 || strcmp(argv[i], "--if") == 0) {
+            } else if (strcmp(argv[i], "--iif") == 0 || strcmp(argv[i], "--lan-if") == 0 || strcmp(argv[i], "--if") == 0) {
                 if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 if_str = argv[++i];
             } else if (!if_str && argv[i][0] != '-') {
@@ -2099,7 +2102,7 @@ int main(int argc, char **argv) {
             }
         }
         if (!if_str) {
-            fprintf(stderr, "Error: missing interface argument. Usage: %s del-if <iface[,iface2]> [--pin-dir <path>]\n", argv[0]);
+            fprintf(stderr, "Error: missing interface argument. Usage: %s del-iif <iface[,iface2]> [--pin-dir <path>]\n", argv[0]);
             return 1;
         }
         return do_del_iif(if_str, pin_dir);

@@ -17,7 +17,7 @@
 - **动态防路由死锁（Anti-Loopback）**：针对 WireGuard 服务端 Endpoint（IP:Port）进行精准识别并强制直连放行，支持命令行热修改与一键禁用（`del-endpoint` 或 `set-endpoint none`）。
 - **双模全覆盖（本机 + 局域网透明网关）**：
   - **本机流量**：基于 `cgroup/connect` + `sendmsg` 提前绑定 `wg0` 源 IP，彻底免去本地 Masquerade。
-  - **转发流量**：支持挂载 eBPF **TC Ingress** 钩子至局域网网卡（支持多网卡绑定与 `add-if`/`del-if` 热插拔），原生兼容标准（0x8100, 0x88A8）与多厂商 QinQ 双层 VLAN 封装（0x9100, 0x9200, 0x9300）及非 VLAN 极速短路优化，在内核路由查表前提前打标，使局域网转发流量同样享用底层的统一 LPM 白名单。
+  - **转发流量**：支持挂载 eBPF **TC Ingress** 钩子至入接口（`--iif`，支持多网卡绑定与 `add-iif`/`del-iif` 热插拔，亦兼容 `--lan-if` 及 `add-if`/`del-if`），原生兼容标准（0x8100, 0x88A8）与多厂商 QinQ 双层 VLAN 封装（0x9100, 0x9200, 0x9300）及非 VLAN 极速短路优化，在内核路由查表前提前打标，使局域网转发流量同样享用底层的统一 LPM 白名单。
 - **零停机无感原子热更新**：支持实时更新规则或 Endpoint，先就地增量写入内核 Map 并通过单遍扫描安全剪枝过期条目，彻底消除迭代器失效与二次遍历性能损耗，绝不出现白名单清空窗口期，保障网络会话零中断。
 
 ---
@@ -99,7 +99,7 @@ sudo ./router-ctl.sh start \
     --wg-endpoint 198.51.100.1:51820 \
     --rule-file var.nft \
     --oif wg0 \
-    --lan-if eth1,eth2    # 支持逗号分隔或多次使用 --lan-if
+    --iif eth1,eth2    # 对齐入接口 (iif) 与出接口 (oif)，亦兼容 --lan-if
 ```
 
 > [!TIP]
@@ -112,7 +112,7 @@ sudo ./router-ctl.sh start \
 - `--cgroup-path <path>`：cgroup v2 挂载路径（默认 `/sys/fs/cgroup`）。
 - `--pin-dir <path>`：（可选）BPF 对象持久化 Pin 目录（默认 `/sys/fs/bpf/wg_routing`）。
 - `--oif <iface>`：（可选）分流目标出接口（Outbound Interface，如 `wg0`），自动提取其源 IP 注入本地 UDP 发包；不指定则为纯 FWMARK 模式。
-- `--lan-if <iface>`：（可选）绑定局域网网卡启用 TC Ingress 分流，支持重复或逗号分隔（如 `eth1,eth2` 或 `eth1`）。
+- `--iif <iface>`：（可选）绑定分流入口网卡（Inbound Interface，如局域网网口），启用 TC Ingress 分流，支持重复或逗号分隔（如 `eth1,eth2` 或 `eth1`；兼容历史别名 `--lan-if`）。
 - `--wg-endpoint <IP[:Port]>`：WireGuard 服务端地址（防死锁回环）。
   - 支持带端口：如 `198.51.100.1:51820` 或 `[2001:db8::1]:51820`（仅匹配指定端口）。
   - **支持不带端口**：如 `198.51.100.1` 或 `2001:db8::1`（匹配该 IP 的所有端口全部放行直连）。
@@ -129,7 +129,7 @@ sudo ./router-ctl.sh status
 ```text
 [+] eBPF Router Status:
   Pinned Directory: /sys/fs/bpf/wg_routing
-  LAN Interfaces (TC Ingress Forwarding):
+  Inbound Interfaces (iif / TC Ingress Forwarding):
     - eth1        : [ACTIVE] (ifindex 2, TC ingress filter active)
     - eth2        : [ACTIVE] (ifindex 3, TC ingress filter active)
   Enabled: true, FWMARK: 0x3000 (12288)
@@ -169,17 +169,17 @@ sudo ./router-ctl.sh set-oif wg0
 sudo ./router-ctl.sh del-oif
 ```
 
-### 7. 动态管理局域网转发网卡（add-if / del-if）
+### 7. 动态管理入接口/局域网转发网卡（iif: add-iif / del-iif）
 
-无需重启路由器，支持热插拔网卡或动态将局域网接口纳入/移出 TC Ingress 分流：
+无需重启路由器，支持热插拔网卡或动态将入接口纳入/移出 TC Ingress 分流（与 `--oif` / `set-oif` 严格对称，并向后兼容 `add-if` / `del-if`）：
 
 ```bash
-# 动态添加一个或多个局域网网卡（支持逗号分隔）
-sudo ./router-ctl.sh add-if eth3
-sudo ./router-ctl.sh add-if eth4,eth5
+# 动态添加一个或多个入接口（支持逗号分隔）
+sudo ./router-ctl.sh add-iif eth3
+sudo ./router-ctl.sh add-iif eth4,eth5
 
-# 动态移出网卡并卸载 TC Ingress 过滤器
-sudo ./router-ctl.sh del-if eth3
+# 动态移出入接口并卸载 TC Ingress 过滤器
+sudo ./router-ctl.sh del-iif eth3
 ```
 
 ### 8. 停止并清理
