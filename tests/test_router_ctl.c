@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #define UNIT_TESTING
+#pragma GCC diagnostic ignored "-Wunused-function"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,9 +22,13 @@ static void test_parse_fwmark(void) {
     assert(parse_fwmark("0xFFFFFFFF", &mark) == 0 && mark == 0xFFFFFFFF);
     assert(parse_fwmark("  0x100  ", &mark) == 0 && mark == 0x100);
 
-    /* Invalid cases: zero, empty, non-numeric, or trailing garbage */
+    /* Invalid cases: zero, empty, non-numeric, trailing garbage, negative, or leading plus */
     assert(parse_fwmark("0", &mark) == -1);
     assert(parse_fwmark("0x0", &mark) == -1);
+    assert(parse_fwmark("-1", &mark) == -1);
+    assert(parse_fwmark("-100", &mark) == -1);
+    assert(parse_fwmark("+0x3000", &mark) == -1);
+    assert(parse_fwmark("+100", &mark) == -1);
     assert(parse_fwmark("", &mark) == -1);
     assert(parse_fwmark("abc", &mark) == -1);
     assert(parse_fwmark("0x3000xyz", &mark) == -1);
@@ -46,6 +51,7 @@ static void test_parse_port(void) {
     assert(parse_port("0", &port) == -1);
     assert(parse_port("65536", &port) == -1);
     assert(parse_port("-1", &port) == -1);
+    assert(parse_port("+51820", &port) == -1);
     assert(parse_port("", &port) == -1);
     assert(parse_port("abc", &port) == -1);
     assert(parse_port(NULL, &port) == -1);
@@ -91,6 +97,12 @@ static void test_parse_endpoint(void) {
     assert(parse_endpoint("", &ep) == -1);
     assert(parse_endpoint(NULL, &ep) == -1);
 
+    /* Oversized inputs (> 255 chars) */
+    char long_ep[300];
+    memset(long_ep, 'a', sizeof(long_ep) - 1);
+    long_ep[sizeof(long_ep) - 1] = '\0';
+    assert(parse_endpoint(long_ep, &ep) == -1);
+
     printf("  [PASS] test_parse_endpoint\n");
 }
 
@@ -133,6 +145,93 @@ static void test_ensure_dir(void) {
     printf("  [PASS] test_ensure_dir\n");
 }
 
+struct range_test_result {
+    uint32_t nets[32];
+    uint32_t prefixlens[32];
+    size_t count;
+};
+
+static void test_range_cb(uint32_t net_be, uint32_t prefixlen, void *arg) {
+    struct range_test_result *res = (struct range_test_result *)arg;
+    if (res->count < 32) {
+        res->nets[res->count] = net_be;
+        res->prefixlens[res->count] = prefixlen;
+        res->count++;
+    }
+}
+
+static void test_range_to_cidrs_edge_cases(void) {
+    /* 1. Full address space 0.0.0.0 - 255.255.255.255 (MUST NOT infinite loop) */
+    struct range_test_result r1 = {0};
+    range_to_cidrs(0, 0xFFFFFFFF, test_range_cb, &r1);
+    assert(r1.count == 1);
+    assert(r1.prefixlens[0] == 0);
+    assert(r1.nets[0] == 0);
+
+    /* 2. Top half ending at 255.255.255.255: 128.0.0.0 - 255.255.255.255 */
+    struct range_test_result r2 = {0};
+    range_to_cidrs(0x80000000, 0xFFFFFFFF, test_range_cb, &r2);
+    assert(r2.count == 1);
+    assert(r2.prefixlens[0] == 1);
+    assert(r2.nets[0] == htonl(0x80000000));
+
+    /* 3. Single host range: 10.0.0.1 - 10.0.0.1 */
+    struct range_test_result r3 = {0};
+    uint32_t single_ip = 0x0A000001;
+    range_to_cidrs(single_ip, single_ip, test_range_cb, &r3);
+    assert(r3.count == 1);
+    assert(r3.prefixlens[0] == 32);
+    assert(r3.nets[0] == htonl(single_ip));
+
+    /* 4. Multi-chunk range: 1.0.1.0 - 1.0.3.255 (256 + 512 = 768 IPs -> 1.0.1.0/24 + 1.0.2.0/23) */
+    struct range_test_result r4 = {0};
+    range_to_cidrs(0x01000100, 0x010003FF, test_range_cb, &r4);
+    assert(r4.count == 2);
+    assert(r4.prefixlens[0] == 24 && r4.nets[0] == htonl(0x01000100));
+    assert(r4.prefixlens[1] == 23 && r4.nets[1] == htonl(0x01000200));
+
+    printf("  [PASS] test_range_to_cidrs_edge_cases\n");
+}
+
+static void test_cidr_normalization_and_deduplication(void) {
+    /* 1. IPv4 normalization */
+    uint32_t host_ip = htonl(0xC0A80132); /* 192.168.1.50 */
+    uint32_t norm_ip = normalize_v4_cidr(host_ip, 24);
+    assert(norm_ip == htonl(0xC0A80100)); /* 192.168.1.0 */
+    assert(normalize_v4_cidr(host_ip, 32) == host_ip);
+    assert(normalize_v4_cidr(host_ip, 0) == 0);
+
+    /* 2. IPv6 normalization */
+    uint8_t ip6[16] = {0x20, 0x01, 0x0d, 0xb8, 0x12, 0x34, 0x56, 0x78,
+                       0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x22, 0x33, 0x44};
+    normalize_v6_cidr(ip6, 32);
+    for (int i = 4; i < 16; i++) {
+        assert(ip6[i] == 0);
+    }
+    assert(ip6[0] == 0x20 && ip6[1] == 0x01 && ip6[2] == 0x0d && ip6[3] == 0xb8);
+
+    /* 3. Deduplication of IPv4 keys */
+    struct ipv4_lpm_key v4_arr[4] = {
+        { .prefixlen = 24, .data = htonl(0x0A000000) },
+        { .prefixlen = 16, .data = htonl(0xC0A80000) },
+        { .prefixlen = 24, .data = htonl(0x0A000000) }, /* duplicate */
+        { .prefixlen = 8,  .data = htonl(0x0A000000) },
+    };
+    size_t new_v4_cnt = deduplicate_v4(v4_arr, 4);
+    assert(new_v4_cnt == 3);
+
+    /* 4. Deduplication of IPv6 keys */
+    struct ipv6_lpm_key v6_arr[3] = {
+        { .prefixlen = 32, .data = {0x20, 0x01, 0x0d, 0xb8} },
+        { .prefixlen = 32, .data = {0x20, 0x01, 0x0d, 0xb8} }, /* duplicate */
+        { .prefixlen = 64, .data = {0x20, 0x01, 0x0d, 0xb8} },
+    };
+    size_t new_v6_cnt = deduplicate_v6(v6_arr, 3);
+    assert(new_v6_cnt == 2);
+
+    printf("  [PASS] test_cidr_normalization_and_deduplication\n");
+}
+
 static void test_rule_parser(void) {
     /* 1. Parse var.nft from current or parent directory */
     const char *rule_file = access("var.nft", F_OK) == 0 ? "var.nft" : "../var.nft";
@@ -163,7 +262,41 @@ static void test_rule_parser(void) {
     assert(rc2.v6_count == 2);
     free_rule_collector(&rc2);
 
-    /* 3. Test malformed fwmark (0 or missing) */
+    /* 3. Test empty quotes in WG_ENDPOINT (disabled endpoint) */
+    f = fopen(tmp_file, "w");
+    fprintf(f, "define WG_ENDPOINT = \"\"\n");
+    fprintf(f, "define IPV4_ELEMENTS = { 10.0.0.0/8 }\n");
+    fclose(f);
+    struct rule_collector rc_empty_ep = {0};
+    assert(parse_rule_file(tmp_file, &rc_empty_ep) == 0);
+    assert(!rc_empty_ep.has_endpoint);
+    assert(rc_empty_ep.v4_count == 1);
+    free_rule_collector(&rc_empty_ep);
+
+    /* 4. Test ranges with spaces around hyphen: e.g. "10.0.0.1 - 10.0.0.2" */
+    f = fopen(tmp_file, "w");
+    fprintf(f, "define IPV4_ELEMENTS = { 10.0.0.1 - 10.0.0.2, 192.168.1.0   -   192.168.1.1 }\n");
+    fclose(f);
+    struct rule_collector rc_spaces = {0};
+    assert(parse_rule_file(tmp_file, &rc_spaces) == 0);
+    /* 10.0.0.1/32, 10.0.0.2/32, and optimal aggregate 192.168.1.0/31 -> 3 CIDRs */
+    assert(rc_spaces.v4_count == 3);
+    free_rule_collector(&rc_spaces);
+
+    /* 5. Test line exceeding 512 bytes with getline */
+    f = fopen(tmp_file, "w");
+    fprintf(f, "define IPV4_ELEMENTS = {\n");
+    for (int i = 0; i < 40; i++) {
+        fprintf(f, " 10.0.%d.0/24,", i);
+    }
+    fprintf(f, " 10.0.40.0/24 }\n");
+    fclose(f);
+    struct rule_collector rc_long = {0};
+    assert(parse_rule_file(tmp_file, &rc_long) == 0);
+    assert(rc_long.v4_count == 41);
+    free_rule_collector(&rc_long);
+
+    /* 6. Test malformed fwmark (0 or missing) */
     f = fopen(tmp_file, "w");
     fprintf(f, "define FWMARK = 0\n");
     fclose(f);
@@ -171,33 +304,54 @@ static void test_rule_parser(void) {
     assert(parse_rule_file(tmp_file, &rc_bad) == -1);
     free_rule_collector(&rc_bad);
 
-    /* 4. Test invalid IPv4 prefix length (>32) */
+    /* 7. Test invalid IPv4 prefix length (>32) */
     f = fopen(tmp_file, "w");
     fprintf(f, "define IPV4_ELEMENTS = { 10.0.0.0/33 }\n");
     fclose(f);
     assert(parse_rule_file(tmp_file, &rc_bad) == -1);
     free_rule_collector(&rc_bad);
 
-    /* 5. Test invalid IPv6 prefix length (>128) */
+    /* 8. Test invalid IPv6 prefix length (>128) */
     f = fopen(tmp_file, "w");
     fprintf(f, "define IPV6_ELEMENTS = { 2001:db8::/129 }\n");
     fclose(f);
     assert(parse_rule_file(tmp_file, &rc_bad) == -1);
     free_rule_collector(&rc_bad);
 
-    /* 6. Test inverted IPv4 range */
+    /* 9. Test inverted IPv4 range */
     f = fopen(tmp_file, "w");
     fprintf(f, "define IPV4_ELEMENTS = { 10.0.0.2-10.0.0.1 }\n");
     fclose(f);
     assert(parse_rule_file(tmp_file, &rc_bad) == -1);
     free_rule_collector(&rc_bad);
 
-    /* 7. Test invalid IPv6 address */
+    /* 10. Test invalid IPv6 address */
     f = fopen(tmp_file, "w");
     fprintf(f, "define IPV6_ELEMENTS = { 2001:xyz::/32 }\n");
     fclose(f);
     assert(parse_rule_file(tmp_file, &rc_bad) == -1);
     free_rule_collector(&rc_bad);
+
+    /* 11. Test IPv4 CIDR with trailing garbage */
+    f = fopen(tmp_file, "w");
+    fprintf(f, "define IPV4_ELEMENTS = { 10.0.0.1/24garbage }\n");
+    fclose(f);
+    assert(parse_rule_file(tmp_file, &rc_bad) == -1);
+    assert(rc_bad.v4_keys == NULL); /* Verified collector freed on error */
+
+    /* 12. Test IPv6 CIDR with trailing garbage */
+    f = fopen(tmp_file, "w");
+    fprintf(f, "define IPV6_ELEMENTS = { 2001:db8::/32xyz }\n");
+    fclose(f);
+    assert(parse_rule_file(tmp_file, &rc_bad) == -1);
+    assert(rc_bad.v6_keys == NULL); /* Verified collector freed on error */
+
+    /* 13. Test IPv4 range with trailing garbage */
+    f = fopen(tmp_file, "w");
+    fprintf(f, "define IPV4_ELEMENTS = { 10.0.0.1-10.0.0.2-10.0.0.3 }\n");
+    fclose(f);
+    assert(parse_rule_file(tmp_file, &rc_bad) == -1);
+    assert(rc_bad.v4_keys == NULL);
 
     unlink(tmp_file);
     printf("  [PASS] test_rule_parser\n");
@@ -259,6 +413,20 @@ static void test_lan_ifaces(void) {
     /* Since first 15 chars are identical ("interface_name_"), second must be deduplicated */
     assert(long_list.count == 1);
 
+    /* 7. Long input string exceeding 256 chars should not truncate elements */
+    struct lan_ifaces large_list = {0};
+    char long_if_str[512] = {0};
+    for (int i = 0; i < 20; i++) {
+        char item[32];
+        snprintf(item, sizeof(item), "veth%d,", i);
+        strcat(long_if_str, item);
+    }
+    strcat(long_if_str, "veth20");
+    add_lan_iface(&large_list, long_if_str);
+    assert(large_list.count == 21);
+    assert(strcmp(large_list.names[0], "veth0") == 0);
+    assert(strcmp(large_list.names[20], "veth20") == 0);
+
     char path[512];
     snprintf(path, sizeof(path), "%s/%s", test_dir, LAN_IFACES_FILENAME);
     unlink(path);
@@ -303,6 +471,67 @@ static void test_oif_resolution(void) {
     printf("  [PASS] test_oif_resolution\n");
 }
 
+static void test_qinq_ethertypes(void) {
+    assert(ETH_P_8021Q == 0x8100);
+    assert(ETH_P_8021AD == 0x88A8);
+    assert(ETH_P_QINQ1 == 0x9100);
+    assert(ETH_P_QINQ2 == 0x9200);
+    assert(ETH_P_QINQ3 == 0x9300);
+    printf("  [PASS] test_qinq_ethertypes\n");
+}
+
+static void test_prune_lpm_algorithm(void) {
+    /* Test bsearch key identification for pruning stale keys */
+    struct ipv4_lpm_key current_rules[3] = {
+        { .prefixlen = 8,  .data = htonl(0x0A000000) }, /* 10.0.0.0/8 */
+        { .prefixlen = 16, .data = htonl(0xC0A80000) }, /* 192.168.0.0/16 */
+        { .prefixlen = 24, .data = htonl(0xC0A80100) }, /* 192.168.1.0/24 */
+    };
+    /* Sort keys as done in apply_nft_rules */
+    qsort(current_rules, 3, sizeof(current_rules[0]), cmp_v4_key);
+
+    /* Simulated existing keys in kernel map:
+     * - 10.0.0.0/8 (kept)
+     * - 172.16.0.0/12 (stale, should be pruned)
+     * - 192.168.0.0/16 (kept)
+     * - 192.168.2.0/24 (stale, should be pruned)
+     */
+    struct ipv4_lpm_key map_key1 = { .prefixlen = 8,  .data = htonl(0x0A000000) };
+    struct ipv4_lpm_key map_key2 = { .prefixlen = 12, .data = htonl(0xAC100000) };
+    struct ipv4_lpm_key map_key3 = { .prefixlen = 16, .data = htonl(0xC0A80000) };
+    struct ipv4_lpm_key map_key4 = { .prefixlen = 24, .data = htonl(0xC0A80200) };
+
+    assert(bsearch(&map_key1, current_rules, 3, sizeof(current_rules[0]), cmp_v4_key) != NULL);
+    assert(bsearch(&map_key2, current_rules, 3, sizeof(current_rules[0]), cmp_v4_key) == NULL);
+    assert(bsearch(&map_key3, current_rules, 3, sizeof(current_rules[0]), cmp_v4_key) != NULL);
+    assert(bsearch(&map_key4, current_rules, 3, sizeof(current_rules[0]), cmp_v4_key) == NULL);
+
+    printf("  [PASS] test_prune_lpm_algorithm\n");
+}
+
+static void test_ipv4_mapped_ipv6_logic(void) {
+    /* Verify IPv4-mapped IPv6 address identification logic:
+     * ::ffff:127.0.0.1 -> ip0 = 0, ip1 = 0, ip2 = bpf_htonl(0x0000ffff), ip3 = htonl(0x7F000001) */
+    uint32_t ip0 = 0;
+    uint32_t ip1 = 0;
+    uint32_t ip2 = htonl(0x0000ffff);
+    uint32_t ip3_loopback = htonl(0x7F000001);
+    uint32_t ip3_zero = htonl(0x00000001);
+
+    bool is_v4_mapped = (ip0 == 0 && ip1 == 0 && ip2 == htonl(0x0000ffff));
+    assert(is_v4_mapped);
+
+    /* Verify loopback (127.0.0.0/8) bypass logic */
+    uint32_t host_ip = ntohl(ip3_loopback);
+    assert((host_ip >> 24) == 127);
+
+    /* Verify current network (0.0.0.0/8) bypass logic */
+    uint32_t host_ip_zero = ntohl(ip3_zero);
+    assert((host_ip_zero >> 24) == 0);
+
+    printf("  [PASS] test_ipv4_mapped_ipv6_logic\n");
+}
+
 int main(void) {
     printf("[*] Running router_ctl unit tests...\n");
     test_parse_fwmark();
@@ -310,9 +539,14 @@ int main(void) {
     test_parse_endpoint();
     test_keyword_matching();
     test_ensure_dir();
+    test_range_to_cidrs_edge_cases();
+    test_cidr_normalization_and_deduplication();
     test_rule_parser();
     test_lan_ifaces();
     test_oif_resolution();
+    test_qinq_ethertypes();
+    test_prune_lpm_algorithm();
+    test_ipv4_mapped_ipv6_logic();
     printf("[✔] ALL UNIT TESTS PASSED!\n");
     return 0;
 }

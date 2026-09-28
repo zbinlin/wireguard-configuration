@@ -64,9 +64,8 @@ static char *trim(char *str) {
 
 static void add_lan_iface(struct lan_ifaces *list, const char *arg) {
     if (!arg || !list) return;
-    char buf[256];
-    strncpy(buf, arg, sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = '\0';
+    char *buf = strdup(arg);
+    if (!buf) return;
     char *saveptr = NULL;
     char *tok = strtok_r(buf, " ,\t", &saveptr);
     while (tok) {
@@ -83,20 +82,26 @@ static void add_lan_iface(struct lan_ifaces *list, const char *arg) {
                     break;
                 }
             }
-            if (!exists && list->count < MAX_LAN_IFACES) {
-                memcpy(list->names[list->count], clean_name, IFNAMSIZ);
-                list->count++;
+            if (!exists) {
+                if (list->count < MAX_LAN_IFACES) {
+                    memcpy(list->names[list->count], clean_name, IFNAMSIZ);
+                    list->names[list->count][IFNAMSIZ - 1] = '\0';
+                    list->count++;
+                } else {
+                    fprintf(stderr, "Warning: Maximum number of LAN interfaces (%d) reached, skipping '%s'\n",
+                            MAX_LAN_IFACES, clean_name);
+                }
             }
         }
         tok = strtok_r(NULL, " ,\t", &saveptr);
     }
+    free(buf);
 }
 
 static void remove_lan_iface(struct lan_ifaces *list, const char *arg) {
     if (!arg || !list) return;
-    char buf[256];
-    strncpy(buf, arg, sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = '\0';
+    char *buf = strdup(arg);
+    if (!buf) return;
     char *saveptr = NULL;
     char *tok = strtok_r(buf, " ,\t", &saveptr);
     while (tok) {
@@ -118,6 +123,7 @@ static void remove_lan_iface(struct lan_ifaces *list, const char *arg) {
         }
         tok = strtok_r(NULL, " ,\t", &saveptr);
     }
+    free(buf);
 }
 
 static int get_or_create_lan_map(const char *pin_dir) {
@@ -356,7 +362,11 @@ static bool query_tc_filter(int ifindex, uint32_t handle, uint32_t priority, uin
 
 static bool check_tc_filter_cmd(const char *ifname, uint32_t expected_prog_id) {
     int pipefd[2];
+#ifdef O_CLOEXEC
+    if (pipe2(pipefd, O_CLOEXEC) != 0) return false;
+#else
     if (pipe(pipefd) != 0) return false;
+#endif
 
     pid_t pid = fork();
     if (pid < 0) {
@@ -391,13 +401,16 @@ static bool check_tc_filter_cmd(const char *ifname, uint32_t expected_prog_id) {
             snprintf(id_str, sizeof(id_str), "id %u", expected_prog_id);
         }
         while (fgets(line, sizeof(line), fp)) {
-            if (strstr(line, "tc_router_ingress") || strstr(line, "local_router")) {
-                found = true;
-                break;
-            }
-            if (expected_prog_id > 0 && strstr(line, id_str)) {
-                found = true;
-                break;
+            if (expected_prog_id > 0) {
+                if (strstr(line, id_str)) {
+                    found = true;
+                    break;
+                }
+            } else {
+                if (strstr(line, "tc_router_ingress") || strstr(line, "local_router")) {
+                    found = true;
+                    break;
+                }
             }
         }
         fclose(fp);
@@ -405,7 +418,7 @@ static bool check_tc_filter_cmd(const char *ifname, uint32_t expected_prog_id) {
         close(pipefd[0]);
     }
     int status;
-    waitpid(pid, &status, 0);
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR);
     return found;
 }
 
@@ -438,10 +451,12 @@ static int ensure_dir(const char *path) {
     if (len >= sizeof(tmp)) return -ENAMETOOLONG;
     memcpy(tmp, path, len + 1);
 
+    mode_t dir_mode = (strstr(path, "/sys/fs/bpf") != NULL) ? 0700 : 0755;
+
     for (char *p = tmp + 1; *p; p++) {
         if (*p == '/') {
             *p = '\0';
-            if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
+            if (mkdir(tmp, dir_mode) != 0 && errno != EEXIST) {
                 struct stat st;
                 if (stat(tmp, &st) != 0 || !S_ISDIR(st.st_mode))
                     return -errno;
@@ -449,7 +464,7 @@ static int ensure_dir(const char *path) {
             *p = '/';
         }
     }
-    if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
+    if (mkdir(tmp, dir_mode) != 0 && errno != EEXIST) {
         struct stat st;
         if (stat(tmp, &st) != 0 || !S_ISDIR(st.st_mode))
             return -errno;
@@ -469,7 +484,7 @@ static int remove_pinned(const char *pin_dir, const char *name) {
 
 static void range_to_cidrs(uint32_t start, uint32_t end, void (*cb)(uint32_t net_be, uint32_t prefixlen, void *arg), void *arg) {
     while (start <= end) {
-        uint64_t max_size = start & (-start);
+        uint64_t max_size = start & (-((uint64_t)start));
         if (max_size == 0) max_size = 0x100000000ULL;
 
         uint64_t diff = (uint64_t)end - start + 1;
@@ -480,15 +495,15 @@ static void range_to_cidrs(uint32_t start, uint32_t end, void (*cb)(uint32_t net
         uint32_t prefixlen = 32 - __builtin_ctzll(max_size);
         cb(htonl(start), prefixlen, arg);
 
-        if (start > UINT32_MAX - max_size) break;
-        start += max_size;
+        if (max_size > (uint64_t)end - start) break;
+        start += (uint32_t)max_size;
     }
 }
 
 static int parse_port(const char *port_str, uint16_t *out_port) {
     if (!port_str) return -1;
     while (isspace((unsigned char)*port_str)) port_str++;
-    if (*port_str == '\0') return -1;
+    if (*port_str == '\0' || *port_str < '0' || *port_str > '9') return -1;
 
     char *endptr = NULL;
     errno = 0;
@@ -510,11 +525,11 @@ static int parse_port(const char *port_str, uint16_t *out_port) {
 static int parse_fwmark(const char *str, uint32_t *out_mark) {
     if (!str) return -1;
     while (isspace((unsigned char)*str)) str++;
-    if (*str == '\0') return -1;
+    if (*str == '\0' || *str == '-' || *str == '+') return -1;
 
     char *endptr = NULL;
     errno = 0;
-    unsigned long val = strtoul(str, &endptr, 0);
+    unsigned long long val = strtoull(str, &endptr, 0);
     if (errno != 0 || endptr == str) {
         return -1;
     }
@@ -531,12 +546,17 @@ static int parse_fwmark(const char *str, uint32_t *out_mark) {
 
 static int parse_endpoint(const char *str, struct wg_endpoint *ep) {
     memset(ep, 0, sizeof(*ep));
-    if (!str || strlen(str) == 0) return -1;
+    if (!str || *str == '\0') return -1;
+    if (strlen(str) >= 256) {
+        fprintf(stderr, "Error: Endpoint string too long (max 255 chars)\n");
+        return -1;
+    }
 
     char buf[256];
     strncpy(buf, str, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
     char *t = trim(buf);
+    if (*t == '\0') return -1;
 
     if (t[0] == '[') { // IPv6 in brackets: [addr] or [addr]:port
         char *close_bracket = strchr(t, ']');
@@ -646,18 +666,6 @@ static const char *find_element_block(const char *line, const char *name) {
     return NULL;
 }
 
-static int clear_lpm_map(int map_fd) {
-    char key[64] = {0};
-    int count = 0;
-    while (bpf_map_get_next_key(map_fd, NULL, key) == 0) {
-        if (bpf_map_delete_elem(map_fd, key) != 0) {
-            break;
-        }
-        count++;
-    }
-    return count;
-}
-
 static int count_map_keys(int map_fd) {
     char key[64] = {0};
     char next_key[64] = {0};
@@ -684,14 +692,20 @@ struct rule_collector {
     struct ipv6_lpm_key *v6_keys;
     size_t v6_count;
     size_t v6_cap;
+
+    bool oom;
 };
 
 static void v4_collect_cb(uint32_t net_be, uint32_t prefixlen, void *arg) {
     struct rule_collector *rc = (struct rule_collector *)arg;
+    if (rc->oom) return;
     if (rc->v4_count >= rc->v4_cap) {
         size_t new_cap = rc->v4_cap ? rc->v4_cap * 2 : 64;
         struct ipv4_lpm_key *new_keys = realloc(rc->v4_keys, new_cap * sizeof(*new_keys));
-        if (!new_keys) return;
+        if (!new_keys) {
+            rc->oom = true;
+            return;
+        }
         rc->v4_keys = new_keys;
         rc->v4_cap = new_cap;
     }
@@ -701,10 +715,14 @@ static void v4_collect_cb(uint32_t net_be, uint32_t prefixlen, void *arg) {
 }
 
 static int add_v6_rule(struct rule_collector *rc, const uint8_t *ip6_bytes, uint32_t prefixlen) {
+    if (rc->oom) return -1;
     if (rc->v6_count >= rc->v6_cap) {
         size_t new_cap = rc->v6_cap ? rc->v6_cap * 2 : 64;
         struct ipv6_lpm_key *new_keys = realloc(rc->v6_keys, new_cap * sizeof(*new_keys));
-        if (!new_keys) return -1;
+        if (!new_keys) {
+            rc->oom = true;
+            return -1;
+        }
         rc->v6_keys = new_keys;
         rc->v6_cap = new_cap;
     }
@@ -712,6 +730,141 @@ static int add_v6_rule(struct rule_collector *rc, const uint8_t *ip6_bytes, uint
     memcpy(rc->v6_keys[rc->v6_count].data, ip6_bytes, 16);
     rc->v6_count++;
     return 0;
+}
+
+static inline uint32_t normalize_v4_cidr(uint32_t net_be, uint32_t prefixlen) {
+    if (prefixlen == 0) return 0;
+    if (prefixlen >= 32) return net_be;
+    uint32_t mask = htonl(~((1ULL << (32 - prefixlen)) - 1));
+    return net_be & mask;
+}
+
+static inline void normalize_v6_cidr(uint8_t ip6_buf[16], uint32_t prefixlen) {
+    if (prefixlen >= 128) return;
+    uint32_t full_bytes = prefixlen / 8;
+    uint32_t rem_bits = prefixlen % 8;
+    if (full_bytes < 16) {
+        if (rem_bits > 0) {
+            uint8_t mask = (uint8_t)(0xFF << (8 - rem_bits));
+            ip6_buf[full_bytes] &= mask;
+            full_bytes++;
+        }
+        for (uint32_t b = full_bytes; b < 16; b++) {
+            ip6_buf[b] = 0;
+        }
+    }
+}
+
+static int cmp_v4_key(const void *a, const void *b) {
+    const struct ipv4_lpm_key *ka = a;
+    const struct ipv4_lpm_key *kb = b;
+    if (ka->prefixlen != kb->prefixlen)
+        return ka->prefixlen < kb->prefixlen ? -1 : 1;
+    uint32_t da = ntohl(ka->data);
+    uint32_t db = ntohl(kb->data);
+    if (da != db)
+        return da < db ? -1 : 1;
+    return 0;
+}
+
+static int cmp_v6_key(const void *a, const void *b) {
+    const struct ipv6_lpm_key *ka = a;
+    const struct ipv6_lpm_key *kb = b;
+    if (ka->prefixlen != kb->prefixlen)
+        return ka->prefixlen < kb->prefixlen ? -1 : 1;
+    return memcmp(ka->data, kb->data, 16);
+}
+
+static size_t deduplicate_v4(struct ipv4_lpm_key *keys, size_t count) {
+    if (count <= 1) return count;
+    qsort(keys, count, sizeof(*keys), cmp_v4_key);
+    size_t w = 1;
+    for (size_t r = 1; r < count; r++) {
+        if (keys[r].prefixlen != keys[w - 1].prefixlen || keys[r].data != keys[w - 1].data) {
+            keys[w++] = keys[r];
+        }
+    }
+    return w;
+}
+
+static size_t deduplicate_v6(struct ipv6_lpm_key *keys, size_t count) {
+    if (count <= 1) return count;
+    qsort(keys, count, sizeof(*keys), cmp_v6_key);
+    size_t w = 1;
+    for (size_t r = 1; r < count; r++) {
+        if (keys[r].prefixlen != keys[w - 1].prefixlen || memcmp(keys[r].data, keys[w - 1].data, 16) != 0) {
+            keys[w++] = keys[r];
+        }
+    }
+    return w;
+}
+
+static void prune_lpm_v4_map(int map_fd, const struct ipv4_lpm_key *keys, size_t count) {
+    struct ipv4_lpm_key cur_key = {0};
+    struct ipv4_lpm_key next_key = {0};
+    void *lookup_key = NULL;
+
+    struct ipv4_lpm_key *to_delete = NULL;
+    size_t del_count = 0;
+    size_t del_cap = 0;
+
+    while (bpf_map_get_next_key(map_fd, lookup_key, &next_key) == 0) {
+        cur_key = next_key;
+        lookup_key = &cur_key;
+
+        if (count == 0 || bsearch(&next_key, keys, count, sizeof(*keys), cmp_v4_key) == NULL) {
+            if (del_count >= del_cap) {
+                size_t new_cap = del_cap ? del_cap * 2 : 128;
+                struct ipv4_lpm_key *new_arr = realloc(to_delete, new_cap * sizeof(*new_arr));
+                if (!new_arr) {
+                    fprintf(stderr, "Warning: Memory allocation failure while pruning IPv4 map\n");
+                    break;
+                }
+                to_delete = new_arr;
+                del_cap = new_cap;
+            }
+            to_delete[del_count++] = next_key;
+        }
+    }
+
+    for (size_t i = 0; i < del_count; i++) {
+        bpf_map_delete_elem(map_fd, &to_delete[i]);
+    }
+    free(to_delete);
+}
+
+static void prune_lpm_v6_map(int map_fd, const struct ipv6_lpm_key *keys, size_t count) {
+    struct ipv6_lpm_key cur_key = {0};
+    struct ipv6_lpm_key next_key = {0};
+    void *lookup_key = NULL;
+
+    struct ipv6_lpm_key *to_delete = NULL;
+    size_t del_count = 0;
+    size_t del_cap = 0;
+
+    while (bpf_map_get_next_key(map_fd, lookup_key, &next_key) == 0) {
+        cur_key = next_key;
+        lookup_key = &cur_key;
+
+        if (count == 0 || bsearch(&next_key, keys, count, sizeof(*keys), cmp_v6_key) == NULL) {
+            if (del_count >= del_cap) {
+                size_t new_cap = del_cap ? del_cap * 2 : 128;
+                struct ipv6_lpm_key *new_arr = realloc(to_delete, new_cap * sizeof(*new_arr));
+                if (!new_arr) {
+                    fprintf(stderr, "Warning: Memory allocation failure while pruning IPv6 map\n");
+                    break;
+                }
+                to_delete = new_arr;
+                del_cap = new_cap;
+            }
+            to_delete[del_count++] = next_key;
+        }
+    }
+
+    for (size_t i = 0; i < del_count; i++) {
+        bpf_map_delete_elem(map_fd, &to_delete[i]);
+    }
+    free(to_delete);
 }
 
 static void free_rule_collector(struct rule_collector *rc) {
@@ -732,11 +885,14 @@ static int parse_rule_file(const char *rule_file, struct rule_collector *rc) {
     }
 
     rc->fwmark = DEFAULT_FWMARK;
-    char line[512];
+    char *line = NULL;
+    size_t line_cap = 0;
+    ssize_t nread;
     int line_num = 0;
     int section = 0; // 0=none, 1=v4, 2=v6
+    int ret = 0;
 
-    while (fgets(line, sizeof(line), f)) {
+    while ((nread = getline(&line, &line_cap, f)) != -1) {
         line_num++;
         char *p = strchr(line, '#');
         if (p) *p = '\0';
@@ -748,14 +904,14 @@ static int parse_rule_file(const char *rule_file, struct rule_collector *rc) {
                 char *eq = strchr(t, '=');
                 if (!eq) {
                     fprintf(stderr, "Error [line %d]: Malformed FWMARK definition (missing '='): %s\n", line_num, t);
-                    fclose(f);
-                    return -1;
+                    ret = -1;
+                    break;
                 }
                 char *v = trim(eq + 1);
                 if (parse_fwmark(v, &rc->fwmark) != 0) {
                     fprintf(stderr, "Error [line %d]: Invalid or zero FWMARK value '%s'. A non-zero FWMARK is strictly required to prevent traffic leaks.\n", line_num, v);
-                    fclose(f);
-                    return -1;
+                    ret = -1;
+                    break;
                 }
                 rc->has_fwmark = true;
                 continue;
@@ -765,21 +921,29 @@ static int parse_rule_file(const char *rule_file, struct rule_collector *rc) {
                 char *eq = strchr(t, '=');
                 if (!eq) {
                     fprintf(stderr, "Error [line %d]: Malformed WG_ENDPOINT definition (missing '='): %s\n", line_num, t);
-                    fclose(f);
-                    return -1;
+                    ret = -1;
+                    break;
                 }
                 char *v = trim(eq + 1);
-                if (*v == '"' || *v == '\'') v++;
-                char *end = v + strlen(v) - 1;
-                if (end > v && (*end == '"' || *end == '\'')) *end = '\0';
+                if (*v == '"' || *v == '\'') {
+                    char q = *v++;
+                    char *end = v + strlen(v) - 1;
+                    if (end >= v && *end == q) *end = '\0';
+                }
                 v = trim(v);
+                if (*v == '\0') {
+                    rc->endpoint[0] = '\0';
+                    rc->has_endpoint = false;
+                    continue;
+                }
                 struct wg_endpoint tmp_ep;
                 if (parse_endpoint(v, &tmp_ep) != 0) {
                     fprintf(stderr, "Error [line %d]: Invalid WG_ENDPOINT '%s'\n", line_num, v);
-                    fclose(f);
-                    return -1;
+                    ret = -1;
+                    break;
                 }
                 strncpy(rc->endpoint, v, sizeof(rc->endpoint) - 1);
+                rc->endpoint[sizeof(rc->endpoint) - 1] = '\0';
                 rc->has_endpoint = true;
                 continue;
             }
@@ -790,8 +954,8 @@ static int parse_rule_file(const char *rule_file, struct rule_collector *rc) {
                 const char *ob = strchr(blk_v4, '{');
                 if (!ob) {
                     fprintf(stderr, "Error [line %d]: Missing '{' in IPV4_ELEMENTS definition\n", line_num);
-                    fclose(f);
-                    return -1;
+                    ret = -1;
+                    break;
                 }
                 section = 1;
                 t = (char *)(ob + 1);
@@ -799,8 +963,8 @@ static int parse_rule_file(const char *rule_file, struct rule_collector *rc) {
                 const char *ob = strchr(blk_v6, '{');
                 if (!ob) {
                     fprintf(stderr, "Error [line %d]: Missing '{' in IPV6_ELEMENTS definition\n", line_num);
-                    fclose(f);
-                    return -1;
+                    ret = -1;
+                    break;
                 }
                 section = 2;
                 t = (char *)(ob + 1);
@@ -817,60 +981,78 @@ static int parse_rule_file(const char *rule_file, struct rule_collector *rc) {
                 section = 0;
             }
 
+            if (cur_section == 1) {
+                /* Normalize spaces around hyphens in IPv4 ranges, e.g. "1.0.1.0 - 1.0.3.255" -> "1.0.1.0-1.0.3.255" */
+                char *src = t, *dst = t;
+                while (*src) {
+                    if (*src == '-') {
+                        while (dst > t && isspace((unsigned char)*(dst - 1))) dst--;
+                        *dst++ = '-';
+                        src++;
+                        while (isspace((unsigned char)*src)) src++;
+                    } else {
+                        *dst++ = *src++;
+                    }
+                }
+                *dst = '\0';
+            }
+
             char *saveptr = NULL;
             char *token = strtok_r(t, " ,\t\r\n", &saveptr);
             while (token) {
                 if (cur_section == 1) { // IPv4
                     if (strchr(token, '-')) {
                         char s_ip[64] = {0}, e_ip[64] = {0};
-                        if (sscanf(token, "%63[^-]-%63s", s_ip, e_ip) != 2) {
+                        char extra = '\0';
+                        if (sscanf(token, "%63[^-]-%63[^ \t\r\n]%c", s_ip, e_ip, &extra) != 2) {
                             fprintf(stderr, "Error [line %d]: Malformed IPv4 range '%s'\n", line_num, token);
-                            fclose(f);
-                            return -1;
+                            ret = -1;
+                            break;
                         }
                         uint32_t s = 0, e = 0;
                         if (inet_pton(AF_INET, trim(s_ip), &s) != 1) {
                             fprintf(stderr, "Error [line %d]: Invalid start IP '%s' in range '%s'\n", line_num, s_ip, token);
-                            fclose(f);
-                            return -1;
+                            ret = -1;
+                            break;
                         }
                         if (inet_pton(AF_INET, trim(e_ip), &e) != 1) {
                             fprintf(stderr, "Error [line %d]: Invalid end IP '%s' in range '%s'\n", line_num, e_ip, token);
-                            fclose(f);
-                            return -1;
+                            ret = -1;
+                            break;
                         }
                         if (ntohl(s) > ntohl(e)) {
                             fprintf(stderr, "Error [line %d]: Inverted IPv4 range '%s' (start > end)\n", line_num, token);
-                            fclose(f);
-                            return -1;
+                            ret = -1;
+                            break;
                         }
                         range_to_cidrs(ntohl(s), ntohl(e), v4_collect_cb, rc);
                     } else if (strchr(token, '/')) {
                         char ip_str[64] = {0};
                         uint32_t plen = 32;
-                        if (sscanf(token, "%63[^/]/%u", ip_str, &plen) != 2) {
+                        char extra = '\0';
+                        if (sscanf(token, "%63[^/]/%u%c", ip_str, &plen, &extra) != 2) {
                             fprintf(stderr, "Error [line %d]: Malformed IPv4 CIDR '%s'\n", line_num, token);
-                            fclose(f);
-                            return -1;
+                            ret = -1;
+                            break;
                         }
                         if (plen > 32) {
                             fprintf(stderr, "Error [line %d]: Invalid IPv4 prefix length /%u in '%s'\n", line_num, plen, token);
-                            fclose(f);
-                            return -1;
+                            ret = -1;
+                            break;
                         }
                         uint32_t net = 0;
                         if (inet_pton(AF_INET, trim(ip_str), &net) != 1) {
                             fprintf(stderr, "Error [line %d]: Invalid IPv4 address '%s' in '%s'\n", line_num, ip_str, token);
-                            fclose(f);
-                            return -1;
+                            ret = -1;
+                            break;
                         }
-                        v4_collect_cb(net, plen, rc);
+                        v4_collect_cb(normalize_v4_cidr(net, plen), plen, rc);
                     } else {
                         uint32_t net = 0;
                         if (inet_pton(AF_INET, token, &net) != 1) {
                             fprintf(stderr, "Error [line %d]: Invalid IPv4 address '%s'\n", line_num, token);
-                            fclose(f);
-                            return -1;
+                            ret = -1;
+                            break;
                         }
                         v4_collect_cb(net, 32, rc);
                     }
@@ -878,40 +1060,50 @@ static int parse_rule_file(const char *rule_file, struct rule_collector *rc) {
                     char ip_str[64] = {0};
                     uint32_t plen = 128;
                     if (strchr(token, '/')) {
-                        if (sscanf(token, "%63[^/]/%u", ip_str, &plen) != 2) {
+                        char extra = '\0';
+                        if (sscanf(token, "%63[^/]/%u%c", ip_str, &plen, &extra) != 2) {
                             fprintf(stderr, "Error [line %d]: Malformed IPv6 CIDR '%s'\n", line_num, token);
-                            fclose(f);
-                            return -1;
+                            ret = -1;
+                            break;
                         }
                         if (plen > 128) {
                             fprintf(stderr, "Error [line %d]: Invalid IPv6 prefix length /%u in '%s'\n", line_num, plen, token);
-                            fclose(f);
-                            return -1;
+                            ret = -1;
+                            break;
                         }
                     } else {
                         strncpy(ip_str, token, sizeof(ip_str) - 1);
+                        ip_str[sizeof(ip_str) - 1] = '\0';
                     }
                     uint8_t ip6_buf[16] = {0};
                     if (inet_pton(AF_INET6, trim(ip_str), ip6_buf) != 1) {
                         fprintf(stderr, "Error [line %d]: Invalid IPv6 address '%s'\n", line_num, ip_str);
-                        fclose(f);
-                        return -1;
+                        ret = -1;
+                        break;
                     }
+                    normalize_v6_cidr(ip6_buf, plen);
                     if (add_v6_rule(rc, ip6_buf, plen) != 0) {
                         fprintf(stderr, "Error: Memory allocation failure while parsing IPv6 rules\n");
-                        fclose(f);
-                        return -1;
+                        ret = -1;
+                        break;
                     }
                 }
                 token = strtok_r(NULL, " ,\t\r\n", &saveptr);
             }
+            if (ret != 0) break;
         }
     }
 
+    free(line);
     fclose(f);
 
-    if (section != 0) {
-        fprintf(stderr, "Error: Unexpected EOF while parsing element block (missing closing '}')\n");
+    if (ret != 0 || rc->oom || section != 0) {
+        if (section != 0 && ret == 0) {
+            fprintf(stderr, "Error: Unexpected EOF while parsing element block (missing closing '}')\n");
+        } else if (rc->oom && ret == 0) {
+            fprintf(stderr, "Error: Memory allocation failure while parsing rules\n");
+        }
+        free_rule_collector(rc);
         return -1;
     }
 
@@ -967,8 +1159,11 @@ static int do_stop(const char *pin_dir, const struct lan_ifaces *cli_lan_ifaces)
     remove_pinned(pin_dir, "router_config_map");
 
     if (access(pin_dir, F_OK) == 0) {
-        if (rmdir(pin_dir) != 0 && errno != ENOENT) {
-            fprintf(stderr, "Warning: failed to remove directory '%s': %s\n", pin_dir, strerror(errno));
+        if (strcmp(pin_dir, "/sys/fs/bpf") != 0 && strcmp(pin_dir, "/sys/fs") != 0 &&
+            strcmp(pin_dir, "/sys") != 0 && strcmp(pin_dir, "/") != 0) {
+            if (rmdir(pin_dir) != 0 && errno != ENOENT) {
+                fprintf(stderr, "Warning: failed to remove directory '%s': %s\n", pin_dir, strerror(errno));
+            }
         }
     }
     printf("[✔] Successfully stopped and unpinned.\n");
@@ -1065,8 +1260,8 @@ static int apply_nft_rules(const char *rule_file, const char *wg_endpoint_str, c
         return -1;
     }
 
-    clear_lpm_map(v4_fd);
-    clear_lpm_map(v6_fd);
+    rc.v4_count = deduplicate_v4(rc.v4_keys, rc.v4_count);
+    rc.v6_count = deduplicate_v6(rc.v6_keys, rc.v6_count);
 
     int v4_loaded = 0;
     for (size_t i = 0; i < rc.v4_count; i++) {
@@ -1083,6 +1278,10 @@ static int apply_nft_rules(const char *rule_file, const char *wg_endpoint_str, c
             v6_loaded++;
         }
     }
+
+    /* Prune stale entries from prior runs while avoiding zero-rule window */
+    prune_lpm_v4_map(v4_fd, rc.v4_keys, rc.v4_count);
+    prune_lpm_v6_map(v6_fd, rc.v6_keys, rc.v6_count);
 
     /* 1. Update Config Map */
     uint32_t zero = 0;
@@ -1481,11 +1680,6 @@ static int do_del_oif(const char *pin_dir) {
 static int do_set_endpoint(const char *endpoint_str, const char *pin_dir) {
     if (!pin_dir) pin_dir = DEFAULT_PIN_DIR;
 
-    struct wg_endpoint ep;
-    if (parse_endpoint(endpoint_str, &ep) != 0) {
-        return 1;
-    }
-
     char path[512];
     snprintf(path, sizeof(path), "%s/wg_endpoint_map", pin_dir);
     int ep_fd = bpf_obj_get(path);
@@ -1495,6 +1689,29 @@ static int do_set_endpoint(const char *endpoint_str, const char *pin_dir) {
     }
 
     uint32_t zero = 0;
+    struct wg_endpoint ep = {0};
+
+    if (!endpoint_str || *endpoint_str == '\0' ||
+        strcasecmp(endpoint_str, "none") == 0 ||
+        strcasecmp(endpoint_str, "disable") == 0 ||
+        strcasecmp(endpoint_str, "disabled") == 0 ||
+        strcmp(endpoint_str, "\"\"") == 0 ||
+        strcmp(endpoint_str, "''") == 0) {
+        if (bpf_map_update_elem(ep_fd, &zero, &ep, BPF_ANY) != 0) {
+            fprintf(stderr, "Error: Failed to update wg_endpoint_map: %s\n", strerror(errno));
+            close(ep_fd);
+            return 1;
+        }
+        close(ep_fd);
+        printf("[✔] WireGuard anti-loopback endpoint disabled (removed).\n");
+        return 0;
+    }
+
+    if (parse_endpoint(endpoint_str, &ep) != 0) {
+        close(ep_fd);
+        return 1;
+    }
+
     if (bpf_map_update_elem(ep_fd, &zero, &ep, BPF_ANY) != 0) {
         fprintf(stderr, "Error: Failed to update wg_endpoint_map: %s\n", strerror(errno));
         close(ep_fd);
@@ -1627,7 +1844,7 @@ static int do_status(const char *pin_dir) {
 }
 
 static void print_usage(const char *prog) {
-    printf("Usage: %s <start|stop|reload|set-endpoint|set-oif|del-oif|add-if|del-if|status> [options]\n\n", prog);
+    printf("Usage: %s <start|stop|reload|set-endpoint|del-endpoint|set-oif|del-oif|add-if|del-if|status> [options]\n\n", prog);
     printf("Commands:\n");
     printf("  start          Load eBPF, attach to cgroup and optional LAN interfaces, and apply rules\n");
     printf("                 Options: --cgroup-path <path>    (default: /sys/fs/cgroup)\n");
@@ -1645,14 +1862,20 @@ static void print_usage(const char *prog) {
     printf("                 Options: --rule-file <var.nft>   (required)\n");
     printf("                          --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n");
     printf("                          --wg-endpoint <IP[:Port]>\n");
-    printf("                          --fwmark <mark>\n\n");
-    printf("  set-endpoint   Dynamically update WireGuard endpoint (IP[:Port])\n");
+    printf("                          --fwmark <mark>\n");
+    printf("                          --oif <iface>           (optional outbound interface to bind UDP source IP)\n\n");
+    printf("  set-endpoint   Dynamically update WireGuard endpoint (IP[:Port], or 'none' to disable)\n");
     printf("                 Options: --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n");
-    printf("                 Usage:   %s set-endpoint <IP[:Port]> [--pin-dir <path>]\n\n", prog);
-    printf("  set-oif <iface> Dynamically set/update outbound interface (oif) and its source IP\n");
-    printf("                 Options: --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n\n");
+    printf("                 Usage:   %s set-endpoint <IP[:Port]|none> [--pin-dir <path>]\n\n", prog);
+    printf("  del-endpoint   Dynamically remove WireGuard endpoint (disables anti-loopback bypass)\n");
+    printf("                 Options: --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n");
+    printf("                 Usage:   %s del-endpoint [--pin-dir <path>]\n\n", prog);
+    printf("  set-oif        Dynamically set/update outbound interface (oif) and its source IP\n");
+    printf("                 Options: --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n");
+    printf("                 Usage:   %s set-oif <iface> [--pin-dir <path>]\n\n", prog);
     printf("  del-oif        Dynamically remove outbound interface (oif) and disable source IP injection\n");
-    printf("                 Options: --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n\n");
+    printf("                 Options: --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n");
+    printf("                 Usage:   %s del-oif [--pin-dir <path>]\n\n", prog);
     printf("  add-if         Dynamically attach TC ingress filter to LAN interface(s)\n");
     printf("                 Options: --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n");
     printf("                 Usage:   %s add-if <iface[,iface2]> [--pin-dir <path>]\n\n", prog);
@@ -1661,6 +1884,7 @@ static void print_usage(const char *prog) {
     printf("                 Usage:   %s del-if <iface[,iface2]> [--pin-dir <path>]\n\n", prog);
     printf("  status         Show current eBPF router status, LAN interfaces, and map statistics\n");
     printf("                 Options: --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n");
+    printf("                 Usage:   %s status [--pin-dir <path>]\n", prog);
 }
 
 #ifndef UNIT_TESTING
@@ -1684,20 +1908,27 @@ int main(int argc, char **argv) {
         struct lan_ifaces lan_list = {0};
 
         for (int i = 2; i < argc; i++) {
-            if (strcmp(argv[i], "--cgroup-path") == 0 && i + 1 < argc) {
+            if (strcmp(argv[i], "--cgroup-path") == 0) {
+                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 cgroup_path = argv[++i];
-            } else if (strcmp(argv[i], "--pin-dir") == 0 && i + 1 < argc) {
+            } else if (strcmp(argv[i], "--pin-dir") == 0) {
+                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 pin_dir = argv[++i];
-            } else if (strcmp(argv[i], "--rule-file") == 0 && i + 1 < argc) {
+            } else if (strcmp(argv[i], "--rule-file") == 0) {
+                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 rule_file = argv[++i];
-            } else if (strcmp(argv[i], "--wg-endpoint") == 0 && i + 1 < argc) {
+            } else if (strcmp(argv[i], "--wg-endpoint") == 0 || strcmp(argv[i], "--endpoint") == 0) {
+                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 wg_endpoint = argv[++i];
-            } else if (strcmp(argv[i], "--fwmark") == 0 && i + 1 < argc) {
+            } else if (strcmp(argv[i], "--fwmark") == 0) {
+                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 fwmark = argv[++i];
-            } else if ((strcmp(argv[i], "--oif") == 0 || strcmp(argv[i], "--egress-dev") == 0 || strcmp(argv[i], "--wg-dev") == 0) && i + 1 < argc) {
+            } else if (strcmp(argv[i], "--oif") == 0 || strcmp(argv[i], "--egress-dev") == 0 || strcmp(argv[i], "--wg-dev") == 0) {
+                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 oif_dev = argv[++i];
-            } else if ((strcmp(argv[i], "--lan-if") == 0 || strcmp(argv[i], "--forward-if") == 0 ||
-                        strcmp(argv[i], "--lan-interface") == 0) && i + 1 < argc) {
+            } else if (strcmp(argv[i], "--lan-if") == 0 || strcmp(argv[i], "--forward-if") == 0 ||
+                       strcmp(argv[i], "--lan-interface") == 0) {
+                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 add_lan_iface(&lan_list, argv[++i]);
             } else {
                 fprintf(stderr, "Unknown argument '%s'\n", argv[i]);
@@ -1709,10 +1940,12 @@ int main(int argc, char **argv) {
     } else if (strcmp(cmd, "stop") == 0 || strcmp(cmd, "unload") == 0) {
         struct lan_ifaces cli_lan = {0};
         for (int i = 2; i < argc; i++) {
-            if (strcmp(argv[i], "--pin-dir") == 0 && i + 1 < argc) {
+            if (strcmp(argv[i], "--pin-dir") == 0) {
+                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 pin_dir = argv[++i];
-            } else if ((strcmp(argv[i], "--lan-if") == 0 || strcmp(argv[i], "--forward-if") == 0 ||
-                        strcmp(argv[i], "--lan-interface") == 0) && i + 1 < argc) {
+            } else if (strcmp(argv[i], "--lan-if") == 0 || strcmp(argv[i], "--forward-if") == 0 ||
+                       strcmp(argv[i], "--lan-interface") == 0) {
+                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 add_lan_iface(&cli_lan, argv[++i]);
             } else {
                 fprintf(stderr, "Unknown argument '%s'\n", argv[i]);
@@ -1728,15 +1961,20 @@ int main(int argc, char **argv) {
         const char *oif_dev = NULL;
 
         for (int i = 2; i < argc; i++) {
-            if (strcmp(argv[i], "--rule-file") == 0 && i + 1 < argc) {
+            if (strcmp(argv[i], "--rule-file") == 0) {
+                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 rule_file = argv[++i];
-            } else if (strcmp(argv[i], "--pin-dir") == 0 && i + 1 < argc) {
+            } else if (strcmp(argv[i], "--pin-dir") == 0) {
+                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 pin_dir = argv[++i];
-            } else if (strcmp(argv[i], "--wg-endpoint") == 0 && i + 1 < argc) {
+            } else if (strcmp(argv[i], "--wg-endpoint") == 0 || strcmp(argv[i], "--endpoint") == 0) {
+                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 wg_endpoint = argv[++i];
-            } else if (strcmp(argv[i], "--fwmark") == 0 && i + 1 < argc) {
+            } else if (strcmp(argv[i], "--fwmark") == 0) {
+                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 fwmark = argv[++i];
-            } else if ((strcmp(argv[i], "--oif") == 0 || strcmp(argv[i], "--egress-dev") == 0 || strcmp(argv[i], "--wg-dev") == 0) && i + 1 < argc) {
+            } else if (strcmp(argv[i], "--oif") == 0 || strcmp(argv[i], "--egress-dev") == 0 || strcmp(argv[i], "--wg-dev") == 0) {
+                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 oif_dev = argv[++i];
             } else {
                 fprintf(stderr, "Unknown argument '%s'\n", argv[i]);
@@ -1752,8 +1990,12 @@ int main(int argc, char **argv) {
     } else if (strcmp(cmd, "set-endpoint") == 0) {
         const char *ep_str = NULL;
         for (int i = 2; i < argc; i++) {
-            if (strcmp(argv[i], "--pin-dir") == 0 && i + 1 < argc) {
+            if (strcmp(argv[i], "--pin-dir") == 0) {
+                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 pin_dir = argv[++i];
+            } else if ((strcmp(argv[i], "--wg-endpoint") == 0 || strcmp(argv[i], "--endpoint") == 0)) {
+                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
+                ep_str = argv[++i];
             } else if (!ep_str && argv[i][0] != '-') {
                 ep_str = argv[i];
             } else {
@@ -1763,15 +2005,33 @@ int main(int argc, char **argv) {
             }
         }
         if (!ep_str) {
-            fprintf(stderr, "Error: missing endpoint argument. Usage: %s set-endpoint <IP[:Port]> [--pin-dir <path>]\n", argv[0]);
+            fprintf(stderr, "Error: missing endpoint argument. Usage: %s set-endpoint <IP[:Port]|none> [--pin-dir <path>]\n", argv[0]);
             return 1;
         }
         return do_set_endpoint(ep_str, pin_dir);
+    } else if (strcmp(cmd, "del-endpoint") == 0 || strcmp(cmd, "unset-endpoint") == 0 || strcmp(cmd, "clear-endpoint") == 0) {
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--pin-dir") == 0) {
+                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
+                pin_dir = argv[++i];
+            } else if (argv[i][0] != '-') {
+                /* ignore */
+            } else {
+                fprintf(stderr, "Unknown argument '%s'\n", argv[i]);
+                print_usage(argv[0]);
+                return 1;
+            }
+        }
+        return do_set_endpoint("none", pin_dir);
     } else if (strcmp(cmd, "set-oif") == 0 || strcmp(cmd, "add-oif") == 0) {
         const char *oif_name = NULL;
         for (int i = 2; i < argc; i++) {
-            if (strcmp(argv[i], "--pin-dir") == 0 && i + 1 < argc) {
+            if (strcmp(argv[i], "--pin-dir") == 0) {
+                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 pin_dir = argv[++i];
+            } else if (strcmp(argv[i], "--oif") == 0) {
+                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
+                oif_name = argv[++i];
             } else if (!oif_name && argv[i][0] != '-') {
                 oif_name = argv[i];
             } else {
@@ -1780,10 +2040,15 @@ int main(int argc, char **argv) {
                 return 1;
             }
         }
+        if (!oif_name) {
+            fprintf(stderr, "Error: missing interface argument. Usage: %s set-oif <iface> [--pin-dir <path>]\n", argv[0]);
+            return 1;
+        }
         return do_set_oif(oif_name, pin_dir);
     } else if (strcmp(cmd, "del-oif") == 0 || strcmp(cmd, "unset-oif") == 0 || strcmp(cmd, "clear-oif") == 0) {
         for (int i = 2; i < argc; i++) {
-            if (strcmp(argv[i], "--pin-dir") == 0 && i + 1 < argc) {
+            if (strcmp(argv[i], "--pin-dir") == 0) {
+                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 pin_dir = argv[++i];
             } else if (argv[i][0] != '-') {
                 /* ignore */
@@ -1797,8 +2062,12 @@ int main(int argc, char **argv) {
     } else if (strcmp(cmd, "add-if") == 0 || strcmp(cmd, "add-lan-if") == 0) {
         const char *if_str = NULL;
         for (int i = 2; i < argc; i++) {
-            if (strcmp(argv[i], "--pin-dir") == 0 && i + 1 < argc) {
+            if (strcmp(argv[i], "--pin-dir") == 0) {
+                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 pin_dir = argv[++i];
+            } else if (strcmp(argv[i], "--lan-if") == 0 || strcmp(argv[i], "--if") == 0) {
+                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
+                if_str = argv[++i];
             } else if (!if_str && argv[i][0] != '-') {
                 if_str = argv[i];
             } else {
@@ -1815,8 +2084,12 @@ int main(int argc, char **argv) {
     } else if (strcmp(cmd, "del-if") == 0 || strcmp(cmd, "del-lan-if") == 0 || strcmp(cmd, "remove-if") == 0) {
         const char *if_str = NULL;
         for (int i = 2; i < argc; i++) {
-            if (strcmp(argv[i], "--pin-dir") == 0 && i + 1 < argc) {
+            if (strcmp(argv[i], "--pin-dir") == 0) {
+                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 pin_dir = argv[++i];
+            } else if (strcmp(argv[i], "--lan-if") == 0 || strcmp(argv[i], "--if") == 0) {
+                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
+                if_str = argv[++i];
             } else if (!if_str && argv[i][0] != '-') {
                 if_str = argv[i];
             } else {
@@ -1832,7 +2105,8 @@ int main(int argc, char **argv) {
         return do_del_iif(if_str, pin_dir);
     } else if (strcmp(cmd, "status") == 0) {
         for (int i = 2; i < argc; i++) {
-            if (strcmp(argv[i], "--pin-dir") == 0 && i + 1 < argc) {
+            if (strcmp(argv[i], "--pin-dir") == 0) {
+                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 pin_dir = argv[++i];
             } else {
                 fprintf(stderr, "Unknown argument '%s'\n", argv[i]);

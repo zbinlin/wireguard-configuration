@@ -10,14 +10,15 @@
 
 - **原生免 Masquerade**：在应用层 `connect()` 触发内核路由查表**之前**设置 Socket Mark，使内核首次寻址时直接从 `wg0` 接口挑选 IPv6 / IPv4 本地源地址绑定，彻底免去 SNAT。
 - **UDP / QUIC 首包精准绑定（可选 `--oif`）**：在无连接 UDP（`sendmsg`/`sendto`）场景下，支持自动识别并注入出接口（如 `wg0`）的源 IP，解决 Linux 内核 UDP 首包路由时序问题，彻底告别 UDP/QUIC 首包源 IP 选错或泄漏。
+- **双栈安全与 IPv4 映射支持**：内核 eBPF 原生识别 Dual-Stack Socket 的 IPv4-mapped IPv6 地址（`::ffff:0:0/96`），自动解包对齐 IPv4 白名单规则，并在发包时精准注入 IPv4 映射源 IP，彻底杜绝双栈应用程序访问本地或局域网服务时的连接异常与地址污染。
 - **纯 C 原生实现**：零 Python 依赖，单二进制文件直接运行，极速启动与热更新。
-- **兼容 nftables 规则语法**：原生解析 `var.nft` 格式规则文件，支持 `define FWMARK`、`define IPV4_ELEMENTS`、`define IPV6_ELEMENTS`。
-- **原生支持 IP Range 范围分解**：C 语言位运算内置 Range 分解算法，自动将 `1.0.1.0-1.0.3.255` 等范围转换为最精简的不重叠 CIDR 并写入内核 `LPM_TRIE`。
-- **动态防路由死锁（Anti-Loopback）**：针对 WireGuard 服务端 Endpoint（IP:Port）进行精准识别并强制直连放行，支持命令行热修改。
+- **兼容 nftables 规则语法**：原生解析 `var.nft` 格式规则文件，支持 `define FWMARK`、`define IPV4_ELEMENTS`、`define IPV6_ELEMENTS`，支持任意行长度与宽松格式（如带空格的 IP 范围），严格防御 CIDR 尾部脏字符。
+- **原生支持 IP Range 范围分解与 CIDR 规范化**：C 语言位运算内置 Range 分解算法，自动将 `1.0.1.0-1.0.3.255` 等范围转换为最精简的不重叠 CIDR，并自动规范主机位掩码与内存去重后写入内核 `LPM_TRIE`。
+- **动态防路由死锁（Anti-Loopback）**：针对 WireGuard 服务端 Endpoint（IP:Port）进行精准识别并强制直连放行，支持命令行热修改与一键禁用（`del-endpoint` 或 `set-endpoint none`）。
 - **双模全覆盖（本机 + 局域网透明网关）**：
   - **本机流量**：基于 `cgroup/connect` + `sendmsg` 提前绑定 `wg0` 源 IP，彻底免去本地 Masquerade。
-  - **转发流量**：支持挂载 eBPF **TC Ingress** 钩子至局域网网卡（支持多网卡绑定），在内核路由查表前提前打标，使局域网转发流量同样享用底层的统一 LPM 白名单。
-- **零停机热更新**：支持实时更新规则或 Endpoint，秒级热写入内核 Map，无需重新挂载或重启 eBPF 程序。
+  - **转发流量**：支持挂载 eBPF **TC Ingress** 钩子至局域网网卡（支持多网卡绑定与 `add-if`/`del-if` 热插拔），原生兼容标准（0x8100, 0x88A8）与多厂商 QinQ 双层 VLAN 封装（0x9100, 0x9200, 0x9300）及非 VLAN 极速短路优化，在内核路由查表前提前打标，使局域网转发流量同样享用底层的统一 LPM 白名单。
+- **零停机无感原子热更新**：支持实时更新规则或 Endpoint，先就地增量写入内核 Map 并通过单遍扫描安全剪枝过期条目，彻底消除迭代器失效与二次遍历性能损耗，绝不出现白名单清空窗口期，保障网络会话零中断。
 
 ---
 
@@ -128,25 +129,33 @@ sudo ./router-ctl.sh status
 ```text
 [+] eBPF Router Status:
   Pinned Directory: /sys/fs/bpf/wg_routing
-  LAN Interfaces (TC Ingress): eth1, eth2 (Forwarding bypass active)
+  LAN Interfaces (TC Ingress Forwarding):
+    - eth1        : [ACTIVE] (ifindex 2, TC ingress filter active)
+    - eth2        : [ACTIVE] (ifindex 3, TC ingress filter active)
   Enabled: true, FWMARK: 0x3000 (12288)
+  UDP Injected Egress IPs (oif): IPv4=10.0.0.2, IPv6=fd00::2
   WireGuard Endpoint: 198.51.100.1:51820
   Bypass IPv4 CIDRs in kernel map: 18
   Bypass IPv6 CIDRs in kernel map: 11
 ```
 
-### 5. 动态热重载规则
+### 5. 动态热重载规则（无感原子更新）
 
-当修改了 `var.nft` 文件后，直接执行热重载（无需重启 eBPF）：
+当修改了 `var.nft` 文件后，直接执行热重载（无需重启 eBPF，原子增量写入，绝不出现白名单清空窗口期）：
 
 ```bash
 sudo ./router-ctl.sh reload --rule-file var.nft
 ```
 
-如果仅需动态切换 WireGuard Endpoint（如 DDNS 变更）：
+如果仅需动态切换或移除 WireGuard Endpoint（如 DDNS 变更或临时关闭直连放行）：
 
 ```bash
+# 动态更新 Endpoint（支持带端口或不带端口）
 sudo ./router-ctl.sh set-endpoint 203.0.113.88:51820
+
+# 动态移除/禁用 Endpoint 放行规则（支持两种等效写法）
+sudo ./router-ctl.sh del-endpoint
+sudo ./router-ctl.sh set-endpoint none
 ```
 
 ### 6. 动态管理分流出接口（oif）
@@ -160,7 +169,20 @@ sudo ./router-ctl.sh set-oif wg0
 sudo ./router-ctl.sh del-oif
 ```
 
-### 7. 停止并清理
+### 7. 动态管理局域网转发网卡（add-if / del-if）
+
+无需重启路由器，支持热插拔网卡或动态将局域网接口纳入/移出 TC Ingress 分流：
+
+```bash
+# 动态添加一个或多个局域网网卡（支持逗号分隔）
+sudo ./router-ctl.sh add-if eth3
+sudo ./router-ctl.sh add-if eth4,eth5
+
+# 动态移出网卡并卸载 TC Ingress 过滤器
+sudo ./router-ctl.sh del-if eth3
+```
+
+### 8. 停止并清理
 
 ```bash
 sudo ./router-ctl.sh stop

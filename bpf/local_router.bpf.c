@@ -81,6 +81,17 @@ static __always_inline void apply_sendmsg6_policy(struct bpf_sock_addr *ctx) {
     __u32 mark = cfg->fwmark;
     bpf_setsockopt(ctx, SOL_SOCKET, SO_MARK, &mark, sizeof(mark));
 
+    /* If destination is IPv4-mapped IPv6 (::ffff:x.x.x.x), inject IPv4-mapped source IP */
+    if (ctx->user_ip6[0] == 0 && ctx->user_ip6[1] == 0 && ctx->user_ip6[2] == bpf_htonl(0x0000ffff)) {
+        if (cfg->oif_src_ip4) {
+            ctx->msg_src_ip6[0] = 0;
+            ctx->msg_src_ip6[1] = 0;
+            ctx->msg_src_ip6[2] = bpf_htonl(0x0000ffff);
+            ctx->msg_src_ip6[3] = cfg->oif_src_ip4;
+        }
+        return;
+    }
+
     if (cfg->oif_src_ip6[0] || cfg->oif_src_ip6[1] ||
         cfg->oif_src_ip6[2] || cfg->oif_src_ip6[3]) {
         ctx->msg_src_ip6[0] = cfg->oif_src_ip6[0];
@@ -93,6 +104,8 @@ static __always_inline void apply_sendmsg6_policy(struct bpf_sock_addr *ctx) {
 static __always_inline bool should_bypass_ip4_common(__u32 user_ip4, __u16 user_port_be) {
     __u32 ip = bpf_ntohl(user_ip4);
 
+    /* Bypass Current Network / Unspecified (0.0.0.0/8) */
+    if ((ip >> 24) == 0) return true;
     /* Bypass Loopback (127.0.0.0/8) */
     if ((ip >> 24) == 127) return true;
     /* Bypass Multicast (224.0.0.0/4) & Broadcast */
@@ -118,9 +131,17 @@ static __always_inline bool should_bypass_ip4_common(__u32 user_ip4, __u16 user_
 }
 
 static __always_inline bool should_bypass_ip6_common(__u32 ip0, __u32 ip1, __u32 ip2, __u32 ip3, __u16 user_port_be) {
+    /* Bypass Unspecified (::) */
+    if (ip0 == 0 && ip1 == 0 && ip2 == 0 && ip3 == 0)
+        return true;
+
     /* Bypass Loopback (::1) */
     if (ip0 == 0 && ip1 == 0 && ip2 == 0 && ip3 == bpf_htonl(1))
         return true;
+
+    /* Handle IPv4-mapped IPv6 address (::ffff:0:0/96) */
+    if (ip0 == 0 && ip1 == 0 && ip2 == bpf_htonl(0x0000ffff))
+        return should_bypass_ip4_common(ip3, user_port_be);
 
     /* Bypass Link-local (fe80::/10) */
     if ((bpf_ntohl(ip0) & 0xffc00000) == 0xfe800000)
@@ -200,11 +221,6 @@ int tc_router_ingress(struct __sk_buff *skb) {
     void *data = (void *)(long)skb->data;
     void *data_end = (void *)(long)skb->data_end;
 
-    __u32 zero = 0;
-    struct router_config *cfg = bpf_map_lookup_elem(&router_config_map, &zero);
-    if (!cfg || !cfg->enabled)
-        return TC_ACT_OK;
-
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end)
         return TC_ACT_OK;
@@ -212,10 +228,11 @@ int tc_router_ingress(struct __sk_buff *skb) {
     __u16 proto = bpf_ntohs(eth->h_proto);
     void *nh = eth + 1;
 
-    /* Handle 802.1Q and 802.1ad VLAN encapsulations (supports up to 2 tags for QinQ) */
-    #pragma unroll
+    /* Handle 802.1Q, 802.1ad, and QinQ VLAN encapsulations (supports up to 2 tags) */
+#pragma unroll
     for (int i = 0; i < 2; i++) {
-        if (proto == ETH_P_8021Q || proto == ETH_P_8021AD) {
+        if (proto == ETH_P_8021Q || proto == ETH_P_8021AD ||
+            proto == ETH_P_QINQ1 || proto == ETH_P_QINQ2 || proto == ETH_P_QINQ3) {
             struct {
                 __be16 tci;
                 __be16 encap_proto;
@@ -224,8 +241,19 @@ int tc_router_ingress(struct __sk_buff *skb) {
                 return TC_ACT_OK;
             proto = bpf_ntohs(vlan->encap_proto);
             nh = vlan + 1;
+        } else {
+            break;
         }
     }
+
+    /* Fast exit for non-IP frames (ARP, LLDP, STP, etc.) before map lookup */
+    if (proto != ETH_P_IP && proto != ETH_P_IPV6)
+        return TC_ACT_OK;
+
+    __u32 zero = 0;
+    struct router_config *cfg = bpf_map_lookup_elem(&router_config_map, &zero);
+    if (!cfg || !cfg->enabled)
+        return TC_ACT_OK;
 
     if (proto == ETH_P_IP) {
         struct iphdr *iph = nh;
