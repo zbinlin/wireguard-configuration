@@ -7,9 +7,9 @@ BUILD_BIN="$SCRIPT_DIR/build/router_ctl"
 TARGET_BIN="$SCRIPT_DIR/target/router_ctl"
 
 BIN=""
-if [ -f "$BUILD_BIN" ]; then
+if [ -x "$BUILD_BIN" ]; then
     BIN="$BUILD_BIN"
-elif [ -f "$TARGET_BIN" ]; then
+elif [ -x "$TARGET_BIN" ]; then
     BIN="$TARGET_BIN"
 else
     echo "[*] router_ctl binary not found, compiling..."

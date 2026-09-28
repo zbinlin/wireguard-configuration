@@ -5,7 +5,8 @@ BPFTOOL ?= bpftool
 ARCH ?= $(shell uname -m | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/')
 BUILD_DIR ?= build
 
-BPF_CFLAGS = -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH) -Wno-missing-declarations -Iinclude -I$(BUILD_DIR) -I/usr/include
+BPF_CFLAGS = -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH) -Wall -Wextra -Wno-missing-declarations -Iinclude -I$(BUILD_DIR) -I/usr/include
+CFLAGS ?= -O2 -Wall -Wextra -Wformat=2 -Wformat-security -Iinclude -I$(BUILD_DIR) -Isrc -I.
 LDFLAGS = -lbpf -lelf -lz
 
 all: $(BUILD_DIR)/router_ctl
@@ -23,10 +24,10 @@ $(BUILD_DIR)/local_router.skel.h: $(BUILD_DIR)/local_router.bpf.o | $(BUILD_DIR)
 	$(BPFTOOL) gen skeleton $< > $@
 
 $(BUILD_DIR)/router_ctl: src/router_ctl.c include/router_common.h $(BUILD_DIR)/local_router.skel.h | $(BUILD_DIR)
-	$(GCC) -O2 -Wall -Wextra -Iinclude -I$(BUILD_DIR) -Isrc -I. $< $(LDFLAGS) -o $@
+	$(GCC) $(CFLAGS) $< $(LDFLAGS) -o $@
 
 $(BUILD_DIR)/test_router_ctl: tests/test_router_ctl.c src/router_ctl.c include/router_common.h $(BUILD_DIR)/local_router.skel.h | $(BUILD_DIR)
-	$(GCC) -O2 -Wall -Wextra -Iinclude -I$(BUILD_DIR) -Isrc -I. $< $(LDFLAGS) -o $@
+	$(GCC) $(CFLAGS) $< $(LDFLAGS) -o $@
 
 test: $(BUILD_DIR)/test_router_ctl
 	./$(BUILD_DIR)/test_router_ctl

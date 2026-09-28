@@ -45,6 +45,18 @@
 #define ETH_P_8021AD 0x88A8
 #endif
 
+#ifndef ETH_P_QINQ1
+#define ETH_P_QINQ1 0x9100
+#endif
+
+#ifndef ETH_P_QINQ2
+#define ETH_P_QINQ2 0x9200
+#endif
+
+#ifndef ETH_P_QINQ3
+#define ETH_P_QINQ3 0x9300
+#endif
+
 #ifndef IFNAMSIZ
 #define IFNAMSIZ 16
 #endif
