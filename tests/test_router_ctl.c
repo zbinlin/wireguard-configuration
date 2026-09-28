@@ -300,7 +300,7 @@ static void test_oif_resolution(void) {
     assert(cfg.oif_src_ip4 == 0);
     assert(cfg.oif_src_ip6[0] == 0 && cfg.oif_src_ip6[3] == 0);
 
-    printf(" [PASS] test_oif_resolution\n");
+    printf("  [PASS] test_oif_resolution\n");
 }
 
 int main(void) {

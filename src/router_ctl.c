@@ -992,18 +992,20 @@ static int get_interface_ips(const char *ifname, uint32_t *ip4_be, uint32_t ip6_
         if (!ifa->ifa_addr || strcmp(ifa->ifa_name, ifname) != 0)
             continue;
 
+        bool is_loopback = (strcmp(ifname, "lo") == 0 || (ifa->ifa_flags & IFF_LOOPBACK));
+
         if (ifa->ifa_addr->sa_family == AF_INET && *ip4_be == 0) {
             struct sockaddr_in *p4 = (struct sockaddr_in *)ifa->ifa_addr;
             uint32_t ip = ntohl(p4->sin_addr.s_addr);
-            /* Exclude loopback (127.0.0.0/8) and link-local (169.254.0.0/16 APIPA) */
-            if ((ip >> 24) != 127 && (ip & 0xFFFF0000) != 0xA9FE0000) {
+            /* Exclude loopback (127.0.0.0/8) unless querying loopback interface, and exclude link-local (169.254.0.0/16 APIPA) */
+            if ((is_loopback || (ip >> 24) != 127) && (ip & 0xFFFF0000) != 0xA9FE0000) {
                 *ip4_be = p4->sin_addr.s_addr;
                 found_usable_ip = true;
             }
         } else if (ifa->ifa_addr->sa_family == AF_INET6 && !has_ip6(ip6_be)) {
             struct sockaddr_in6 *p6 = (struct sockaddr_in6 *)ifa->ifa_addr;
-            /* Exclude loopback (::1) and link-local (fe80::/10) */
-            if (!IN6_IS_ADDR_LOOPBACK(&p6->sin6_addr) && !IN6_IS_ADDR_LINKLOCAL(&p6->sin6_addr)) {
+            /* Exclude loopback (::1) unless querying loopback interface, and exclude link-local (fe80::/10) */
+            if ((is_loopback || !IN6_IS_ADDR_LOOPBACK(&p6->sin6_addr)) && !IN6_IS_ADDR_LINKLOCAL(&p6->sin6_addr)) {
                 memcpy(ip6_be, &p6->sin6_addr, sizeof(uint32_t) * 4);
                 found_usable_ip = true;
             }
