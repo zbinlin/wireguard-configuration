@@ -43,13 +43,51 @@ struct {
     __type(value, __u32);
 } lan_ifaces_map SEC(".maps");
 
-static __always_inline void apply_mark(struct bpf_sock_addr *ctx) {
+static __always_inline struct router_config *get_router_config(void) {
     __u32 zero = 0;
     struct router_config *cfg = bpf_map_lookup_elem(&router_config_map, &zero);
     if (!cfg || !cfg->enabled)
+        return NULL;
+    return cfg;
+}
+
+static __always_inline void apply_connect_policy(struct bpf_sock_addr *ctx) {
+    struct router_config *cfg = get_router_config();
+    if (!cfg)
         return;
+
     __u32 mark = cfg->fwmark;
     bpf_setsockopt(ctx, SOL_SOCKET, SO_MARK, &mark, sizeof(mark));
+}
+
+static __always_inline void apply_sendmsg4_policy(struct bpf_sock_addr *ctx) {
+    struct router_config *cfg = get_router_config();
+    if (!cfg)
+        return;
+
+    __u32 mark = cfg->fwmark;
+    bpf_setsockopt(ctx, SOL_SOCKET, SO_MARK, &mark, sizeof(mark));
+
+    if (cfg->oif_src_ip4) {
+        ctx->msg_src_ip4 = cfg->oif_src_ip4;
+    }
+}
+
+static __always_inline void apply_sendmsg6_policy(struct bpf_sock_addr *ctx) {
+    struct router_config *cfg = get_router_config();
+    if (!cfg)
+        return;
+
+    __u32 mark = cfg->fwmark;
+    bpf_setsockopt(ctx, SOL_SOCKET, SO_MARK, &mark, sizeof(mark));
+
+    if (cfg->oif_src_ip6[0] || cfg->oif_src_ip6[1] ||
+        cfg->oif_src_ip6[2] || cfg->oif_src_ip6[3]) {
+        ctx->msg_src_ip6[0] = cfg->oif_src_ip6[0];
+        ctx->msg_src_ip6[1] = cfg->oif_src_ip6[1];
+        ctx->msg_src_ip6[2] = cfg->oif_src_ip6[2];
+        ctx->msg_src_ip6[3] = cfg->oif_src_ip6[3];
+    }
 }
 
 static __always_inline bool should_bypass_ip4_common(__u32 user_ip4, __u16 user_port_be) {
@@ -129,7 +167,7 @@ SEC("cgroup/connect4")
 int sock_connect4(struct bpf_sock_addr *ctx) {
     if (should_bypass_v4(ctx))
         return 1;
-    apply_mark(ctx);
+    apply_connect_policy(ctx);
     return 1;
 }
 
@@ -137,7 +175,7 @@ SEC("cgroup/sendmsg4")
 int sock_sendmsg4(struct bpf_sock_addr *ctx) {
     if (should_bypass_v4(ctx))
         return 1;
-    apply_mark(ctx);
+    apply_sendmsg4_policy(ctx);
     return 1;
 }
 
@@ -145,7 +183,7 @@ SEC("cgroup/connect6")
 int sock_connect6(struct bpf_sock_addr *ctx) {
     if (should_bypass_v6(ctx))
         return 1;
-    apply_mark(ctx);
+    apply_connect_policy(ctx);
     return 1;
 }
 
@@ -153,7 +191,7 @@ SEC("cgroup/sendmsg6")
 int sock_sendmsg6(struct bpf_sock_addr *ctx) {
     if (should_bypass_v6(ctx))
         return 1;
-    apply_mark(ctx);
+    apply_sendmsg6_policy(ctx);
     return 1;
 }
 

@@ -9,6 +9,7 @@
 ## 核心特性
 
 - **原生免 Masquerade**：在应用层 `connect()` 触发内核路由查表**之前**设置 Socket Mark，使内核首次寻址时直接从 `wg0` 接口挑选 IPv6 / IPv4 本地源地址绑定，彻底免去 SNAT。
+- **UDP / QUIC 首包精准绑定（可选 `--oif`）**：在无连接 UDP（`sendmsg`/`sendto`）场景下，支持自动识别并注入出接口（如 `wg0`）的源 IP，解决 Linux 内核 UDP 首包路由时序问题，彻底告别 UDP/QUIC 首包源 IP 选错或泄漏。
 - **纯 C 原生实现**：零 Python 依赖，单二进制文件直接运行，极速启动与热更新。
 - **兼容 nftables 规则语法**：原生解析 `var.nft` 格式规则文件，支持 `define FWMARK`、`define IPV4_ELEMENTS`、`define IPV6_ELEMENTS`。
 - **原生支持 IP Range 范围分解**：C 语言位运算内置 Range 分解算法，自动将 `1.0.1.0-1.0.3.255` 等范围转换为最精简的不重叠 CIDR 并写入内核 `LPM_TRIE`。
@@ -62,12 +63,14 @@
 根据你的 `var.nft` 中的 `FWMARK`（例如 `0x3000` / `12288`），配置路由表（如 table 100）：
 
 ```bash
-# IPv4 策略路由
+# IPv4 策略路由 (fwmark + 可选源 IP 双保险)
 sudo ip rule add fwmark 0x3000 table 100
+sudo ip rule add from <WG_IPV4>/32 table 100      # 配合 --oif 注入，保障 UDP 首包即刻生效
 sudo ip route add default dev wg0 table 100
 
-# IPv6 策略路由
+# IPv6 策略路由 (fwmark + 可选源 IP 双保险)
 sudo ip -6 rule add fwmark 0x3000 table 100
+sudo ip -6 rule add from <WG_IPV6>/128 table 100  # 配合 --oif 注入，保障 UDP 首包即刻生效
 sudo ip -6 route add default dev wg0 table 100
 ```
 
@@ -84,6 +87,7 @@ make
 sudo ./router-ctl.sh start \
     --cgroup-path /sys/fs/cgroup \
     --wg-endpoint 198.51.100.1:51820 \
+    --oif wg0 \
     --rule-file var.nft
 ```
 
@@ -93,6 +97,7 @@ sudo ./router-ctl.sh start \
     --cgroup-path /sys/fs/cgroup \
     --wg-endpoint 198.51.100.1:51820 \
     --rule-file var.nft \
+    --oif wg0 \
     --lan-if eth1,eth2    # 支持逗号分隔或多次使用 --lan-if
 ```
 
@@ -105,6 +110,7 @@ sudo ./router-ctl.sh start \
 参数说明：
 - `--cgroup-path <path>`：cgroup v2 挂载路径（默认 `/sys/fs/cgroup`）。
 - `--pin-dir <path>`：（可选）BPF 对象持久化 Pin 目录（默认 `/sys/fs/bpf/wg_routing`）。
+- `--oif <iface>`：（可选）分流目标出接口（Outbound Interface，如 `wg0`），自动提取其源 IP 注入本地 UDP 发包；不指定则为纯 FWMARK 模式。
 - `--lan-if <iface>`：（可选）绑定局域网网卡启用 TC Ingress 分流，支持重复或逗号分隔（如 `eth1,eth2` 或 `eth1`）。
 - `--wg-endpoint <IP[:Port]>`：WireGuard 服务端地址（防死锁回环）。
   - 支持带端口：如 `198.51.100.1:51820` 或 `[2001:db8::1]:51820`（仅匹配指定端口）。
@@ -143,7 +149,18 @@ sudo ./router-ctl.sh reload --rule-file var.nft
 sudo ./router-ctl.sh set-endpoint 203.0.113.88:51820
 ```
 
-### 6. 停止并清理
+### 6. 动态管理分流出接口（oif）
+
+运行时无需重启或重新加载规则文件，可秒级热指定、切换或移除分流出接口：
+
+```bash
+# 动态设置/切换出接口（自动读取并注入其 IPv4/IPv6）
+sudo ./router-ctl.sh set-oif wg0
+# 动态移除出接口（清空源 IP 注入，安全回退到纯 fwmark 模式）
+sudo ./router-ctl.sh del-oif
+```
+
+### 7. 停止并清理
 
 ```bash
 sudo ./router-ctl.sh stop
@@ -172,7 +189,7 @@ curl -6 https://api64.ipify.org
 ### 2. 验证直连白名单（Bypass）
 
 尝试访问 `var.nft` 中定义的 IP 或网段（如 `127.0.0.0/8`, `192.168.0.0/16` 或范围 `1.0.1.0-1.0.3.255` 内的 IP）：
-- 数据包不会被打上 Mark，依然走系统主路由表（从物理网卡发出）。
+- 数据包不会被打上 Mark 及源地址不是 `wg0` 的 ip 地址，依然走系统主路由表（从物理网卡发出）。
 
 ---
 

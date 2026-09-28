@@ -13,6 +13,7 @@
 #include <sys/wait.h>
 #include <arpa/inet.h>
 #include <net/if.h>
+#include <ifaddrs.h>
 #include <stdarg.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
@@ -207,7 +208,7 @@ static void load_lan_ifaces(const char *pin_dir, struct lan_ifaces *list) {
         char next_key[IFNAMSIZ] = {0};
         char *lookup_key = NULL;
         while (bpf_map_get_next_key(map_fd, lookup_key, next_key) == 0 && list->count < MAX_LAN_IFACES) {
-            strncpy(list->names[list->count], next_key, IFNAMSIZ - 1);
+            snprintf(list->names[list->count], sizeof(list->names[list->count]), "%s", next_key);
             list->names[list->count][IFNAMSIZ - 1] = '\0';
             list->count++;
             memcpy(prev_key, next_key, IFNAMSIZ);
@@ -974,7 +975,46 @@ static int do_stop(const char *pin_dir, const struct lan_ifaces *cli_lan_ifaces)
     return 0;
 }
 
-static int apply_nft_rules(const char *rule_file, const char *wg_endpoint_str, const char *fwmark_override_str, const char *pin_dir) {
+static inline bool has_ip6(const uint32_t ip6[4]) {
+    return (ip6[0] | ip6[1] | ip6[2] | ip6[3]) != 0;
+}
+
+static int get_interface_ips(const char *ifname, uint32_t *ip4_be, uint32_t ip6_be[4]) {
+    struct ifaddrs *ifaddr, *ifa;
+    *ip4_be = 0;
+    memset(ip6_be, 0, sizeof(uint32_t) * 4);
+
+    if (getifaddrs(&ifaddr) == -1)
+        return -1;
+
+    bool found_usable_ip = false;
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || strcmp(ifa->ifa_name, ifname) != 0)
+            continue;
+
+        if (ifa->ifa_addr->sa_family == AF_INET && *ip4_be == 0) {
+            struct sockaddr_in *p4 = (struct sockaddr_in *)ifa->ifa_addr;
+            uint32_t ip = ntohl(p4->sin_addr.s_addr);
+            /* Exclude loopback (127.0.0.0/8) and link-local (169.254.0.0/16 APIPA) */
+            if ((ip >> 24) != 127 && (ip & 0xFFFF0000) != 0xA9FE0000) {
+                *ip4_be = p4->sin_addr.s_addr;
+                found_usable_ip = true;
+            }
+        } else if (ifa->ifa_addr->sa_family == AF_INET6 && !has_ip6(ip6_be)) {
+            struct sockaddr_in6 *p6 = (struct sockaddr_in6 *)ifa->ifa_addr;
+            /* Exclude loopback (::1) and link-local (fe80::/10) */
+            if (!IN6_IS_ADDR_LOOPBACK(&p6->sin6_addr) && !IN6_IS_ADDR_LINKLOCAL(&p6->sin6_addr)) {
+                memcpy(ip6_be, &p6->sin6_addr, sizeof(uint32_t) * 4);
+                found_usable_ip = true;
+            }
+        }
+    }
+
+    freeifaddrs(ifaddr);
+    return found_usable_ip ? 0 : -1;
+}
+
+static int apply_nft_rules(const char *rule_file, const char *wg_endpoint_str, const char *fwmark_override_str, const char *pin_dir, const char *oif_dev) {
     struct rule_collector rc = {0};
 
     if (parse_rule_file(rule_file, &rc) != 0) {
@@ -1044,10 +1084,42 @@ static int apply_nft_rules(const char *rule_file, const char *wg_endpoint_str, c
 
     /* 1. Update Config Map */
     uint32_t zero = 0;
-    struct router_config cfg = {
-        .fwmark = rc.fwmark,
-        .enabled = 1,
-    };
+    struct router_config cfg = {0};
+
+    /* Preserve existing oif settings on reload unless explicitly overridden */
+    if (bpf_map_lookup_elem(cfg_fd, &zero, &cfg) != 0) {
+        memset(&cfg, 0, sizeof(cfg));
+    }
+
+    cfg.fwmark = rc.fwmark;
+    cfg.enabled = 1;
+
+    if (oif_dev && strlen(oif_dev) > 0) {
+        if (get_interface_ips(oif_dev, &cfg.oif_src_ip4, cfg.oif_src_ip6) == 0) {
+            char buf4[INET_ADDRSTRLEN] = "none";
+            char buf6[INET6_ADDRSTRLEN] = "none";
+            if (cfg.oif_src_ip4)
+                inet_ntop(AF_INET, &cfg.oif_src_ip4, buf4, sizeof(buf4));
+            if (has_ip6(cfg.oif_src_ip6))
+                inet_ntop(AF_INET6, cfg.oif_src_ip6, buf6, sizeof(buf6));
+            printf("  -> Outbound Interface (oif: %s) Source IPs: IPv4=%s, IPv6=%s\n", oif_dev, buf4, buf6);
+        } else {
+            fprintf(stderr, "  [!] Warning: Outbound interface '%s' not found or has no valid IPv4/IPv6 assigned, skipping source IP binding.\n", oif_dev);
+            cfg.oif_src_ip4 = 0;
+            memset(cfg.oif_src_ip6, 0, sizeof(cfg.oif_src_ip6));
+        }
+    } else if (cfg.oif_src_ip4 || has_ip6(cfg.oif_src_ip6)) {
+        char buf4[INET_ADDRSTRLEN] = "none";
+        char buf6[INET6_ADDRSTRLEN] = "none";
+        if (cfg.oif_src_ip4)
+            inet_ntop(AF_INET, &cfg.oif_src_ip4, buf4, sizeof(buf4));
+        if (has_ip6(cfg.oif_src_ip6))
+            inet_ntop(AF_INET6, cfg.oif_src_ip6, buf6, sizeof(buf6));
+        printf("  -> Preserving existing Outbound Interface Source IPs: IPv4=%s, IPv6=%s\n", buf4, buf6);
+    } else {
+        printf("  -> Outbound Interface (oif): None (UDP source IP injection disabled)\n");
+    }
+
     bpf_map_update_elem(cfg_fd, &zero, &cfg, BPF_ANY);
     printf("  -> Configured FWMARK: 0x%x (%u)\n", rc.fwmark, rc.fwmark);
 
@@ -1081,7 +1153,7 @@ static int apply_nft_rules(const char *rule_file, const char *wg_endpoint_str, c
     return 0;
 }
 
-static int do_start(const char *cgroup_path, const char *rule_file, const char *wg_endpoint, const char *fwmark, const char *pin_dir, const struct lan_ifaces *lan_list) {
+static int do_start(const char *cgroup_path, const char *rule_file, const char *wg_endpoint, const char *fwmark, const char *pin_dir, const struct lan_ifaces *lan_list, const char *oif_dev) {
     if (!rule_file) {
         fprintf(stderr, "Error: --rule-file is required for start.\n");
         return 1;
@@ -1214,7 +1286,7 @@ static int do_start(const char *cgroup_path, const char *rule_file, const char *
     }
 
     /* Apply rules */
-    err = apply_nft_rules(rule_file, wg_endpoint, fwmark, pin_dir);
+    err = apply_nft_rules(rule_file, wg_endpoint, fwmark, pin_dir, oif_dev);
     if (err) {
         fprintf(stderr, "Error: Failed to apply routing rules from '%s'\n", rule_file);
         goto cleanup_rollback;
@@ -1232,7 +1304,7 @@ cleanup_rollback:
     return 1;
 }
 
-static int do_add_if(const char *if_str, const char *pin_dir) {
+static int do_add_iif(const char *if_str, const char *pin_dir) {
     if (!pin_dir) pin_dir = DEFAULT_PIN_DIR;
     char prog_path[512];
     snprintf(prog_path, sizeof(prog_path), "%s/%s", pin_dir, TC_PROG_FILENAME);
@@ -1286,7 +1358,7 @@ static int do_add_if(const char *if_str, const char *pin_dir) {
     return 1;
 }
 
-static int do_del_if(const char *if_str, const char *pin_dir) {
+static int do_del_iif(const char *if_str, const char *pin_dir) {
     if (!pin_dir) pin_dir = DEFAULT_PIN_DIR;
 
     uint32_t our_prog_id = get_pinned_tc_prog_id(pin_dir);
@@ -1321,6 +1393,86 @@ static int do_del_if(const char *if_str, const char *pin_dir) {
 
     save_lan_ifaces(pin_dir, &cur_list);
     printf("[✔] Successfully detached and removed %d LAN interface(s)!\n", to_del.count);
+    return 0;
+}
+
+static int do_set_oif(const char *ifname, const char *pin_dir) {
+    if (!pin_dir) pin_dir = DEFAULT_PIN_DIR;
+    if (!ifname || strlen(ifname) == 0) {
+        fprintf(stderr, "Error: missing interface name for set-oif. Usage: set-oif <iface>\n");
+        return 1;
+    }
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/router_config_map", pin_dir);
+    int cfg_fd = bpf_obj_get(path);
+    if (cfg_fd < 0) {
+        fprintf(stderr, "Error: Failed to open router_config_map at %s. Is the router loaded?\n", pin_dir);
+        return 1;
+    }
+
+    uint32_t zero = 0;
+    struct router_config cfg;
+    if (bpf_map_lookup_elem(cfg_fd, &zero, &cfg) != 0) {
+        fprintf(stderr, "Error: Failed to read router_config_map: %s\n", strerror(errno));
+        close(cfg_fd);
+        return 1;
+    }
+
+    if (get_interface_ips(ifname, &cfg.oif_src_ip4, cfg.oif_src_ip6) != 0) {
+        fprintf(stderr, "Error: Failed to find interface '%s' or retrieve its IP addresses.\n", ifname);
+        close(cfg_fd);
+        return 1;
+    }
+
+    if (bpf_map_update_elem(cfg_fd, &zero, &cfg, BPF_ANY) != 0) {
+        fprintf(stderr, "Error: Failed to update router_config_map: %s\n", strerror(errno));
+        close(cfg_fd);
+        return 1;
+    }
+    close(cfg_fd);
+
+    char buf4[INET_ADDRSTRLEN] = "none";
+    char buf6[INET6_ADDRSTRLEN] = "none";
+    if (cfg.oif_src_ip4)
+        inet_ntop(AF_INET, &cfg.oif_src_ip4, buf4, sizeof(buf4));
+    if (has_ip6(cfg.oif_src_ip6))
+        inet_ntop(AF_INET6, cfg.oif_src_ip6, buf6, sizeof(buf6));
+
+    printf("[✔] Outbound interface (oif) updated to '%s' (IPv4: %s, IPv6: %s)\n", ifname, buf4, buf6);
+    return 0;
+}
+
+static int do_del_oif(const char *pin_dir) {
+    if (!pin_dir) pin_dir = DEFAULT_PIN_DIR;
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/router_config_map", pin_dir);
+    int cfg_fd = bpf_obj_get(path);
+    if (cfg_fd < 0) {
+        fprintf(stderr, "Error: Failed to open router_config_map at %s. Is the router loaded?\n", pin_dir);
+        return 1;
+    }
+
+    uint32_t zero = 0;
+    struct router_config cfg;
+    if (bpf_map_lookup_elem(cfg_fd, &zero, &cfg) != 0) {
+        fprintf(stderr, "Error: Failed to read router_config_map: %s\n", strerror(errno));
+        close(cfg_fd);
+        return 1;
+    }
+
+    cfg.oif_src_ip4 = 0;
+    memset(cfg.oif_src_ip6, 0, sizeof(cfg.oif_src_ip6));
+
+    if (bpf_map_update_elem(cfg_fd, &zero, &cfg, BPF_ANY) != 0) {
+        fprintf(stderr, "Error: Failed to update router_config_map: %s\n", strerror(errno));
+        close(cfg_fd);
+        return 1;
+    }
+    close(cfg_fd);
+
+    printf("[✔] Outbound interface (oif) removed (UDP source IP injection disabled, fwmark-only mode active)\n");
     return 0;
 }
 
@@ -1405,9 +1557,20 @@ static int do_status(const char *pin_dir) {
     int cfg_fd = bpf_obj_get(path);
     if (cfg_fd >= 0) {
         uint32_t zero = 0;
-        struct router_config cfg;
+        struct router_config cfg = {0}; /* Zero-init protects against cross-version stack garbage */
         if (bpf_map_lookup_elem(cfg_fd, &zero, &cfg) == 0) {
             printf("  Enabled: %s, FWMARK: 0x%x (%u)\n", cfg.enabled ? "true" : "false", cfg.fwmark, cfg.fwmark);
+            if (cfg.oif_src_ip4 || has_ip6(cfg.oif_src_ip6)) {
+                char buf4[INET_ADDRSTRLEN] = "none";
+                char buf6[INET6_ADDRSTRLEN] = "none";
+                if (cfg.oif_src_ip4)
+                    inet_ntop(AF_INET, &cfg.oif_src_ip4, buf4, sizeof(buf4));
+                if (has_ip6(cfg.oif_src_ip6))
+                    inet_ntop(AF_INET6, cfg.oif_src_ip6, buf6, sizeof(buf6));
+                printf("  UDP Injected Egress IPs (oif): IPv4=%s, IPv6=%s\n", buf4, buf6);
+            } else {
+                printf("  UDP Injected Egress IPs (oif): Disabled (fwmark-only mode)\n");
+            }
         }
         close(cfg_fd);
     }
@@ -1462,7 +1625,7 @@ static int do_status(const char *pin_dir) {
 }
 
 static void print_usage(const char *prog) {
-    printf("Usage: %s <start|stop|reload|set-endpoint|add-if|del-if|status> [options]\n\n", prog);
+    printf("Usage: %s <start|stop|reload|set-endpoint|set-oif|del-oif|add-if|del-if|status> [options]\n\n", prog);
     printf("Commands:\n");
     printf("  start          Load eBPF, attach to cgroup and optional LAN interfaces, and apply rules\n");
     printf("                 Options: --cgroup-path <path>    (default: /sys/fs/cgroup)\n");
@@ -1470,6 +1633,7 @@ static void print_usage(const char *prog) {
     printf("                          --wg-endpoint <IP[:Port]>\n");
     printf("                          --rule-file <var.nft>   (required)\n");
     printf("                          --fwmark <mark>         (optional override)\n");
+    printf("                          --oif <iface>           (optional outbound interface to bind UDP source IP, e.g. wg0)\n");
     printf("                          --lan-if <iface>        (optional LAN interfaces for TC ingress,\n");
     printf("                                                   can be repeated or comma-separated, e.g. eth1,eth2)\n\n");
     printf("  stop           Detach eBPF programs, TC ingress filters, and remove pinned objects\n");
@@ -1483,6 +1647,10 @@ static void print_usage(const char *prog) {
     printf("  set-endpoint   Dynamically update WireGuard endpoint (IP[:Port])\n");
     printf("                 Options: --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n");
     printf("                 Usage:   %s set-endpoint <IP[:Port]> [--pin-dir <path>]\n\n", prog);
+    printf("  set-oif <iface> Dynamically set/update outbound interface (oif) and its source IP\n");
+    printf("                 Options: --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n\n");
+    printf("  del-oif        Dynamically remove outbound interface (oif) and disable source IP injection\n");
+    printf("                 Options: --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n\n");
     printf("  add-if         Dynamically attach TC ingress filter to LAN interface(s)\n");
     printf("                 Options: --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n");
     printf("                 Usage:   %s add-if <iface[,iface2]> [--pin-dir <path>]\n\n", prog);
@@ -1510,6 +1678,7 @@ int main(int argc, char **argv) {
         const char *rule_file = NULL;
         const char *wg_endpoint = NULL;
         const char *fwmark = NULL;
+        const char *oif_dev = NULL;
         struct lan_ifaces lan_list = {0};
 
         for (int i = 2; i < argc; i++) {
@@ -1523,6 +1692,8 @@ int main(int argc, char **argv) {
                 wg_endpoint = argv[++i];
             } else if (strcmp(argv[i], "--fwmark") == 0 && i + 1 < argc) {
                 fwmark = argv[++i];
+            } else if ((strcmp(argv[i], "--oif") == 0 || strcmp(argv[i], "--egress-dev") == 0 || strcmp(argv[i], "--wg-dev") == 0) && i + 1 < argc) {
+                oif_dev = argv[++i];
             } else if ((strcmp(argv[i], "--lan-if") == 0 || strcmp(argv[i], "--forward-if") == 0 ||
                         strcmp(argv[i], "--lan-interface") == 0) && i + 1 < argc) {
                 add_lan_iface(&lan_list, argv[++i]);
@@ -1532,7 +1703,7 @@ int main(int argc, char **argv) {
                 return 1;
             }
         }
-        return do_start(cgroup_path, rule_file, wg_endpoint, fwmark, pin_dir, &lan_list);
+        return do_start(cgroup_path, rule_file, wg_endpoint, fwmark, pin_dir, &lan_list, oif_dev);
     } else if (strcmp(cmd, "stop") == 0 || strcmp(cmd, "unload") == 0) {
         struct lan_ifaces cli_lan = {0};
         for (int i = 2; i < argc; i++) {
@@ -1552,6 +1723,7 @@ int main(int argc, char **argv) {
         const char *rule_file = NULL;
         const char *wg_endpoint = NULL;
         const char *fwmark = NULL;
+        const char *oif_dev = NULL;
 
         for (int i = 2; i < argc; i++) {
             if (strcmp(argv[i], "--rule-file") == 0 && i + 1 < argc) {
@@ -1562,6 +1734,8 @@ int main(int argc, char **argv) {
                 wg_endpoint = argv[++i];
             } else if (strcmp(argv[i], "--fwmark") == 0 && i + 1 < argc) {
                 fwmark = argv[++i];
+            } else if ((strcmp(argv[i], "--oif") == 0 || strcmp(argv[i], "--egress-dev") == 0 || strcmp(argv[i], "--wg-dev") == 0) && i + 1 < argc) {
+                oif_dev = argv[++i];
             } else {
                 fprintf(stderr, "Unknown argument '%s'\n", argv[i]);
                 print_usage(argv[0]);
@@ -1572,7 +1746,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Error: --rule-file is required for reload.\n");
             return 1;
         }
-        return apply_nft_rules(rule_file, wg_endpoint, fwmark, pin_dir);
+        return apply_nft_rules(rule_file, wg_endpoint, fwmark, pin_dir, oif_dev);
     } else if (strcmp(cmd, "set-endpoint") == 0) {
         const char *ep_str = NULL;
         for (int i = 2; i < argc; i++) {
@@ -1591,6 +1765,33 @@ int main(int argc, char **argv) {
             return 1;
         }
         return do_set_endpoint(ep_str, pin_dir);
+    } else if (strcmp(cmd, "set-oif") == 0 || strcmp(cmd, "add-oif") == 0) {
+        const char *oif_name = NULL;
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--pin-dir") == 0 && i + 1 < argc) {
+                pin_dir = argv[++i];
+            } else if (!oif_name && argv[i][0] != '-') {
+                oif_name = argv[i];
+            } else {
+                fprintf(stderr, "Unknown argument '%s'\n", argv[i]);
+                print_usage(argv[0]);
+                return 1;
+            }
+        }
+        return do_set_oif(oif_name, pin_dir);
+    } else if (strcmp(cmd, "del-oif") == 0 || strcmp(cmd, "unset-oif") == 0 || strcmp(cmd, "clear-oif") == 0) {
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--pin-dir") == 0 && i + 1 < argc) {
+                pin_dir = argv[++i];
+            } else if (argv[i][0] != '-') {
+                /* ignore */
+            } else {
+                fprintf(stderr, "Unknown argument '%s'\n", argv[i]);
+                print_usage(argv[0]);
+                return 1;
+            }
+        }
+        return do_del_oif(pin_dir);
     } else if (strcmp(cmd, "add-if") == 0 || strcmp(cmd, "add-lan-if") == 0) {
         const char *if_str = NULL;
         for (int i = 2; i < argc; i++) {
@@ -1608,7 +1809,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Error: missing interface argument. Usage: %s add-if <iface[,iface2]> [--pin-dir <path>]\n", argv[0]);
             return 1;
         }
-        return do_add_if(if_str, pin_dir);
+        return do_add_iif(if_str, pin_dir);
     } else if (strcmp(cmd, "del-if") == 0 || strcmp(cmd, "del-lan-if") == 0 || strcmp(cmd, "remove-if") == 0) {
         const char *if_str = NULL;
         for (int i = 2; i < argc; i++) {
@@ -1626,7 +1827,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Error: missing interface argument. Usage: %s del-if <iface[,iface2]> [--pin-dir <path>]\n", argv[0]);
             return 1;
         }
-        return do_del_if(if_str, pin_dir);
+        return do_del_iif(if_str, pin_dir);
     } else if (strcmp(cmd, "status") == 0) {
         for (int i = 2; i < argc; i++) {
             if (strcmp(argv[i], "--pin-dir") == 0 && i + 1 < argc) {
