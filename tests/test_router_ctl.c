@@ -142,6 +142,21 @@ static void test_ensure_dir(void) {
     rmdir("/tmp/test_wg_router_nested/sub1");
     rmdir("/tmp/test_wg_router_nested");
 
+    /* Test error when path is an existing regular file */
+    const char *tmp_file = "/tmp/test_ensure_dir_file.txt";
+    FILE *f = fopen(tmp_file, "w");
+    assert(f != NULL);
+    fprintf(f, "test\n");
+    fclose(f);
+    assert(ensure_dir(tmp_file) == -ENOTDIR);
+
+    /* Test error when a parent component in the path is a regular file */
+    char sub_path[512];
+    snprintf(sub_path, sizeof(sub_path), "%s/subdir", tmp_file);
+    assert(ensure_dir(sub_path) == -ENOTDIR);
+
+    unlink(tmp_file);
+
     printf("  [PASS] test_ensure_dir\n");
 }
 
@@ -556,7 +571,386 @@ static void test_iif_oif_cli_alignment(void) {
     printf("  [PASS] test_iif_oif_cli_alignment\n");
 }
 
+static void test_default_interface_detection(void) {
+    assert(is_auto_interface_keyword("auto") == true);
+    assert(is_auto_interface_keyword("default") == true);
+    assert(is_auto_interface_keyword("primary") == true);
+    assert(is_auto_interface_keyword("PRIMARY") == true);
+    assert(is_auto_interface_keyword("eth0") == false);
+    assert(is_auto_interface_keyword(NULL) == false);
+    assert(is_auto_interface_keyword("") == false);
+
+    char ifname[IFNAMSIZ] = {0};
+    int ret = get_default_interface(NULL, ifname, sizeof(ifname));
+    if (ret == 0) {
+        assert(strlen(ifname) > 0);
+        assert(strcmp(ifname, "lo") != 0);
+    }
+    printf("  [PASS] test_default_interface_detection\n");
+}
+
+static void test_is_interface_carrier_up(void) {
+    assert(is_interface_carrier_up("lo") == true);
+    assert(is_interface_carrier_up("nonexistent_dev_xyz") == false);
+    assert(is_interface_carrier_up("") == false);
+    assert(is_interface_carrier_up(NULL) == false);
+    printf("  [PASS] test_is_interface_carrier_up\n");
+}
+
+static void test_is_physical_interface(void) {
+    assert(is_physical_interface("lo") == false);
+    assert(is_physical_interface("lo:1") == false);
+    assert(is_physical_interface("wg0") == false);
+    assert(is_physical_interface("tun0") == false);
+    assert(is_physical_interface("tap0") == false);
+    assert(is_physical_interface("docker0") == false);
+    assert(is_physical_interface("br0") == false);
+    assert(is_physical_interface("br-lan") == false);
+    assert(is_physical_interface("virbr0") == false);
+    assert(is_physical_interface("veth1234") == false);
+    assert(is_physical_interface("dummy0") == false);
+    assert(is_physical_interface("sit0") == false);
+    assert(is_physical_interface("bond0") == false);
+    assert(is_physical_interface("gre0") == false);
+    assert(is_physical_interface("vxlan0") == false);
+    assert(is_physical_interface("eth0") == true);
+    assert(is_physical_interface("eth1") == true);
+    assert(is_physical_interface("enp3s0") == true);
+    assert(is_physical_interface("wlan0") == true);
+    assert(is_physical_interface("wwan0") == true);
+    assert(is_physical_interface("eth0.100") == false);
+    assert(is_physical_interface("enp3s0.20") == false);
+    assert(is_physical_interface("ppp0") == false);
+    assert(is_physical_interface("pppoe-wan") == false);
+    assert(is_physical_interface("vlan10") == false);
+    assert(is_physical_interface("macvlan0") == false);
+    assert(is_physical_interface("") == false);
+    assert(is_physical_interface(NULL) == false);
+    printf("  [PASS] test_is_physical_interface\n");
+}
+
+static void test_ipv4_and_ipv6_default_route_matching(void) {
+    assert(is_ipv4_default_route(0, 0, RTF_UP) == true);
+    assert(is_ipv4_default_route(0, 0, 0) == false);
+    assert(is_ipv4_default_route(0x0100000a, 0, RTF_UP) == false);
+    assert(is_ipv4_default_route(0, 0xffffff00, RTF_UP) == false);
+
+    assert(is_ipv6_default_route("00000000000000000000000000000000", "00", RTF_UP) == true);
+    assert(is_ipv6_default_route("00000000000000000000000000000000", "00", RTF_UP | 0x02000000) == true);
+    assert(is_ipv6_default_route("20010db8000000000000000000000000", "00", RTF_UP) == false);
+    assert(is_ipv6_default_route("00000000000000000000000000000000", "20", RTF_UP) == false);
+    assert(is_ipv6_default_route("00000000000000000000000000000000", "00", 0) == false);
+    assert(is_ipv6_default_route(NULL, "00", RTF_UP) == false);
+    assert(is_ipv6_default_route("00000000000000000000000000000000", NULL, RTF_UP) == false);
+    printf("  [PASS] test_ipv4_and_ipv6_default_route_matching\n");
+}
+
+static void test_oif_dev_persistence(void) {
+    const char *tmp_pin = "/tmp/test_oif_persistence_dir";
+    ensure_dir(tmp_pin);
+    char loaded[IFNAMSIZ] = {0};
+
+    save_oif_dev(tmp_pin, "wg0");
+    assert(load_oif_dev(tmp_pin, loaded, sizeof(loaded)) == 0);
+    assert(strcmp(loaded, "wg0") == 0);
+
+    save_oif_dev(tmp_pin, "wg1");
+    assert(load_oif_dev(tmp_pin, loaded, sizeof(loaded)) == 0);
+    assert(strcmp(loaded, "wg1") == 0);
+
+    save_oif_dev(tmp_pin, NULL);
+    assert(load_oif_dev(tmp_pin, loaded, sizeof(loaded)) == -1);
+
+    rmdir(tmp_pin);
+    printf("  [PASS] test_oif_dev_persistence\n");
+}
+
+static void test_cli_argument_validation(void) {
+    char *del_no_args[] = {"router_ctl", "del-iif"};
+    assert(router_ctl_main(2, del_no_args) == 1);
+
+    char *del_auto[] = {"router_ctl", "del-iif", "auto"};
+    assert(router_ctl_main(3, del_auto) == 1);
+
+    char *del_default[] = {"router_ctl", "del-iif", "default"};
+    assert(router_ctl_main(3, del_default) == 1);
+
+    char *del_primary[] = {"router_ctl", "del-iif", "primary"};
+    assert(router_ctl_main(3, del_primary) == 1);
+
+    char *add_no_args[] = {"router_ctl", "add-iif"};
+    assert(router_ctl_main(2, add_no_args) == 1);
+
+    char *start_iif_missing[] = {"router_ctl", "start", "--rule-file", "var.nft", "--iif"};
+    assert(router_ctl_main(5, start_iif_missing) == 1);
+
+    char *start_iif_flag_next[] = {"router_ctl", "start", "--iif", "--rule-file", "var.nft"};
+    assert(router_ctl_main(5, start_iif_flag_next) == 1);
+
+    char *stop_iif_missing[] = {"router_ctl", "stop", "--iif"};
+    assert(router_ctl_main(3, stop_iif_missing) == 1);
+
+    char *stop_iif_flag_next[] = {"router_ctl", "stop", "--iif", "--pin-dir", "/tmp/nonexistent"};
+    assert(router_ctl_main(5, stop_iif_flag_next) == 1);
+
+    char *reload_missing_rule[] = {"router_ctl", "reload", "--rule-file", "--pin-dir", "/tmp/nonexistent"};
+    assert(router_ctl_main(5, reload_missing_rule) == 1);
+
+    char *start_missing_cgroup[] = {"router_ctl", "start", "--cgroup-path", "--rule-file", "var.nft"};
+    assert(router_ctl_main(5, start_missing_cgroup) == 1);
+
+    char *start_missing_pin[] = {"router_ctl", "start", "--pin-dir", "--rule-file", "var.nft"};
+    assert(router_ctl_main(5, start_missing_pin) == 1);
+
+    char *start_missing_oif[] = {"router_ctl", "start", "--rule-file", "var.nft", "--oif", "--fwmark", "0x1"};
+    assert(router_ctl_main(7, start_missing_oif) == 1);
+
+    char *set_oif_missing_pin[] = {"router_ctl", "set-oif", "wg0", "--pin-dir", "--other"};
+    assert(router_ctl_main(5, set_oif_missing_pin) == 1);
+
+    printf("  [PASS] test_cli_argument_validation\n");
+}
+
+static void test_query_tc_filter_zero_expected_prog_id(void) {
+    /* If expected_prog_id == 0, query_tc_filter must return false to avoid false positives */
+    assert(query_tc_filter(1, 1, 1, 0) == false);
+    printf("  [PASS] test_query_tc_filter_zero_expected_prog_id\n");
+}
+
+static void test_do_set_oif_fwmark_mode(void) {
+    const char *tmp_pin = "/tmp/test_do_set_oif_dir";
+    ensure_dir(tmp_pin);
+
+    save_oif_dev(tmp_pin, "wg_unassigned");
+    char loaded[IFNAMSIZ] = {0};
+    assert(load_oif_dev(tmp_pin, loaded, sizeof(loaded)) == 0);
+    assert(strcmp(loaded, "wg_unassigned") == 0);
+
+    /* Cleanup */
+    char txt_path[512];
+    snprintf(txt_path, sizeof(txt_path), "%s/%s", tmp_pin, OIF_DEV_FILENAME);
+    unlink(txt_path);
+    rmdir(tmp_pin);
+    printf("  [PASS] test_do_set_oif_fwmark_mode\n");
+}
+
+static void test_del_iif_all_logic(void) {
+    const char *tmp_pin = "/tmp/test_del_iif_all_dir";
+    ensure_dir(tmp_pin);
+
+    struct lan_ifaces initial = {0};
+    add_lan_iface(&initial, "dummy_eth1,dummy_eth2");
+    save_lan_ifaces(tmp_pin, &initial);
+
+    struct lan_ifaces loaded = {0};
+    load_lan_ifaces(tmp_pin, &loaded);
+    assert(loaded.count == 2);
+
+    struct lan_ifaces del_cmd = {0};
+    add_lan_iface(&del_cmd, "all");
+
+    /* do_del_iif will detach all and clear cur_list */
+    int ret = do_del_iif(&del_cmd, tmp_pin);
+    assert(ret == 0);
+
+    struct lan_ifaces after = {0};
+    load_lan_ifaces(tmp_pin, &after);
+    assert(after.count == 0);
+
+    /* Test calling del-iif all again when cur_list is empty -> returns 0 */
+    assert(do_del_iif(&del_cmd, tmp_pin) == 0);
+
+    char txt_path[512];
+    snprintf(txt_path, sizeof(txt_path), "%s/%s.txt", tmp_pin, LAN_IFACES_FILENAME);
+    unlink(txt_path);
+    snprintf(txt_path, sizeof(txt_path), "%s/lan_ifaces.txt", tmp_pin);
+    unlink(txt_path);
+    rmdir(tmp_pin);
+
+    printf("  [PASS] test_del_iif_all_logic\n");
+}
+
+static void test_del_iif_untracked(void) {
+    const char *tmp_pin = "/tmp/test_del_iif_untracked_dir";
+    ensure_dir(tmp_pin);
+
+    struct lan_ifaces initial = {0};
+    add_lan_iface(&initial, "dummy_eth1");
+    save_lan_ifaces(tmp_pin, &initial);
+
+    struct lan_ifaces del_cmd = {0};
+    add_lan_iface(&del_cmd, "nonexistent99");
+
+    /* do_del_iif with untracked interface should skip and not delete dummy_eth1 */
+    int ret = do_del_iif(&del_cmd, tmp_pin);
+    assert(ret == 0);
+
+    struct lan_ifaces after = {0};
+    load_lan_ifaces(tmp_pin, &after);
+    assert(after.count == 1);
+    assert(strcmp(after.names[0], "dummy_eth1") == 0);
+
+    /* Clean up */
+    char txt_path[512];
+    snprintf(txt_path, sizeof(txt_path), "%s/%s.txt", tmp_pin, LAN_IFACES_FILENAME);
+    unlink(txt_path);
+    snprintf(txt_path, sizeof(txt_path), "%s/lan_ifaces.txt", tmp_pin);
+    unlink(txt_path);
+    rmdir(tmp_pin);
+
+    printf("  [PASS] test_del_iif_untracked\n");
+}
+
+static void test_iif_equals_oif_rejection(void) {
+    struct lan_ifaces list = {0};
+    add_lan_iface(&list, "wg0");
+    /* If LAN interface name equals exclude_oif, resolve_lan_ifaces must reject with -1 */
+    assert(resolve_lan_ifaces(&list, "wg0") == -1);
+
+    struct lan_ifaces list2 = {0};
+    add_lan_iface(&list2, "eth1");
+    /* When LAN interface is different from exclude_oif, resolve_lan_ifaces must succeed */
+    assert(resolve_lan_ifaces(&list2, "wg0") == 0);
+    assert(list2.count == 1);
+    assert(strcmp(list2.names[0], "eth1") == 0);
+
+    /* Test multiple interfaces where one matches exclude_oif */
+    struct lan_ifaces list3 = {0};
+    add_lan_iface(&list3, "eth1,wg0");
+    assert(resolve_lan_ifaces(&list3, "wg0") == -1);
+
+    printf("  [PASS] test_iif_equals_oif_rejection\n");
+}
+
+static int mock_fail_get_default_iface(const char *exclude, char *out, size_t max_len) {
+    (void)exclude; (void)out; (void)max_len;
+    return -1;
+}
+
+static void test_stop_fault_tolerance_on_unresolved_iif(void) {
+    const char *tmp_pin = "/tmp/test_stop_fault_tol_dir";
+    ensure_dir(tmp_pin);
+
+    /* 1. Test stop with --iif auto when default route detection fails */
+    g_mock_get_default_interface = mock_fail_get_default_iface;
+    char *argv_auto[] = {
+        "router_ctl", "stop",
+        "--pin-dir", (char *)tmp_pin,
+        "--iif", "auto"
+    };
+    /* stop must proceed, issue a warning, and return 0 even when auto fails to resolve */
+    int ret_auto = router_ctl_main(6, argv_auto);
+    assert(ret_auto == 0);
+    assert(access(tmp_pin, F_OK) != 0);
+    g_mock_get_default_interface = NULL;
+
+    /* 2. Test stop with an unattached/nonexistent interface name */
+    ensure_dir(tmp_pin);
+    char *argv[] = {
+        "router_ctl", "stop",
+        "--pin-dir", (char *)tmp_pin,
+        "--iif", "nonexistent_iface_99"
+    };
+    int ret = router_ctl_main(6, argv);
+    assert(ret == 0);
+    assert(access(tmp_pin, F_OK) != 0);
+
+    printf("  [PASS] test_stop_fault_tolerance_on_unresolved_iif\n");
+}
+
+static void test_lan_ifaces_fallback_sync(void) {
+    const char *tmp_pin = "/tmp/test_lan_sync_dir";
+    ensure_dir(tmp_pin);
+
+    char txt1[512], txt2[512];
+    snprintf(txt1, sizeof(txt1), "%s/%s.txt", tmp_pin, LAN_IFACES_FILENAME);
+    snprintf(txt2, sizeof(txt2), "%s/lan_ifaces.txt", tmp_pin);
+
+    /* Create dummy stale files */
+    FILE *f = fopen(txt1, "w");
+    assert(f != NULL);
+    fprintf(f, "stale_eth\n");
+    fclose(f);
+    f = fopen(txt2, "w");
+    assert(f != NULL);
+    fprintf(f, "stale_eth2\n");
+    fclose(f);
+
+    assert(access(txt1, F_OK) == 0);
+    assert(access(txt2, F_OK) == 0);
+
+    /* save_lan_ifaces with NULL or empty count should clean up fallback files */
+    struct lan_ifaces empty = {0};
+    save_lan_ifaces(tmp_pin, &empty);
+    assert(access(txt1, F_OK) != 0);
+    assert(access(txt2, F_OK) != 0);
+
+    /* save_lan_ifaces with interfaces should write them */
+    struct lan_ifaces to_save = {0};
+    add_lan_iface(&to_save, "eth1,eth2");
+    save_lan_ifaces(tmp_pin, &to_save);
+    assert(access(txt1, F_OK) == 0);
+
+    struct lan_ifaces loaded = {0};
+    load_lan_ifaces(tmp_pin, &loaded);
+    assert(loaded.count == 2);
+    assert(strcmp(loaded.names[0], "eth1") == 0);
+    assert(strcmp(loaded.names[1], "eth2") == 0);
+
+    /* Clean up */
+    save_lan_ifaces(tmp_pin, NULL);
+    assert(access(txt1, F_OK) != 0);
+    rmdir(tmp_pin);
+
+    printf("  [PASS] test_lan_ifaces_fallback_sync\n");
+}
+
+static void test_tc_ingress_attached_ext_suppression(void) {
+    /* If expected_prog_id == 0, is_tc_ingress_attached_ext must immediately return false */
+    assert(is_tc_ingress_attached_ext("lo", 0, false) == false);
+    assert(is_tc_ingress_attached_ext("lo", 0, true) == false);
+
+    /* If interface name is NULL, must return false */
+    assert(is_tc_ingress_attached_ext(NULL, 12345, false) == false);
+    assert(is_tc_ingress_attached_ext(NULL, 12345, true) == false);
+
+    /* For non-attached interface with allow_cmd_fallback=false, must return false without forking */
+    assert(is_tc_ingress_attached_ext("lo", 12345, false) == false);
+    assert(is_tc_ingress_attached_ext("nonexistent_dev", 12345, false) == false);
+
+    printf("  [PASS] test_tc_ingress_attached_ext_suppression\n");
+}
+
+static void test_ghost_oif_cleanup(void) {
+    const char *tmp_pin = "/tmp/test_ghost_oif_dir";
+    ensure_dir(tmp_pin);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", tmp_pin, OIF_DEV_FILENAME);
+
+    /* Create stale text file */
+    FILE *f = fopen(path, "w");
+    assert(f != NULL);
+    fprintf(f, "stale_wg\n");
+    fclose(f);
+
+    /* Verify stale file exists */
+    assert(access(path, F_OK) == 0);
+
+    /* save_oif_dev with NULL must unlink the fallback file */
+    save_oif_dev(tmp_pin, NULL);
+    assert(access(path, F_OK) != 0);
+
+    /* Calling load_oif_dev should now return -1 */
+    char out_dev[IFNAMSIZ] = {0};
+    assert(load_oif_dev(tmp_pin, out_dev, sizeof(out_dev)) == -1);
+
+    rmdir(tmp_pin);
+    printf("  [PASS] test_ghost_oif_cleanup\n");
+}
+
 int main(void) {
+    libbpf_set_print(libbpf_print_fn);
     printf("[*] Running router_ctl unit tests...\n");
     test_parse_fwmark();
     test_parse_port();
@@ -572,6 +966,21 @@ int main(void) {
     test_prune_lpm_algorithm();
     test_ipv4_mapped_ipv6_logic();
     test_iif_oif_cli_alignment();
+    test_default_interface_detection();
+    test_is_interface_carrier_up();
+    test_is_physical_interface();
+    test_ipv4_and_ipv6_default_route_matching();
+    test_oif_dev_persistence();
+    test_del_iif_all_logic();
+    test_del_iif_untracked();
+    test_query_tc_filter_zero_expected_prog_id();
+    test_do_set_oif_fwmark_mode();
+    test_cli_argument_validation();
+    test_iif_equals_oif_rejection();
+    test_stop_fault_tolerance_on_unresolved_iif();
+    test_lan_ifaces_fallback_sync();
+    test_tc_ingress_attached_ext_suppression();
+    test_ghost_oif_cleanup();
     printf("[✔] ALL UNIT TESTS PASSED!\n");
     return 0;
 }
