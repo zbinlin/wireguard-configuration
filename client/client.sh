@@ -43,8 +43,8 @@ fi
 if [[ -n "${method}" ]]
 then
     hooks=$(cat <<EOF
-PostUp = export ENDPOINT=${ENDPOINT}; export FWMARK=0x00003000; export WG_DEV=${RND_INTERFACE}; bash ${DIR}/hook.sh -m ${method} up
-PreDown = export ENDPOINT=${ENDPOINT}; export FWMARK=0x00003000; export WG_DEV=${RND_INTERFACE}; bash ${DIR}/hook.sh -m ${method} down
+PostUp = export ENDPOINT=${ENDPOINT}; export FWMARK=0x00003000; export WG_DEV=${RND_INTERFACE}; export IPV4_ADDRESS=${IPV4_ADDRESS}; export IPV6_ADDRESS=${IPV6_ADDRESS}; bash ${DIR}/hook.sh -m ${method} up
+PreDown = export ENDPOINT=${ENDPOINT}; export FWMARK=0x00003000; export WG_DEV=${RND_INTERFACE}; export IPV4_ADDRESS=${IPV4_ADDRESS}; export IPV6_ADDRESS=${IPV6_ADDRESS}; bash ${DIR}/hook.sh -m ${method} down
 Table = off
 EOF
     )

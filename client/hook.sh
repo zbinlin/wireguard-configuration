@@ -97,8 +97,12 @@ EOF
         else
             ip -4 rule add to $ENDPOINT table main
         fi
+        [[ "${IPV4_ADDRESS}" != "" ]] && ip -4 rule add from ${IPV4_ADDRESS} table $FWMARK
+        [[ "${IPV6_ADDRESS}" != "" ]] && ip -6 rule add from ${IPV6_ADDRESS} table $FWMARK
         ;;
     (down)
+        [[ "${IPV4_ADDRESS}" != "" ]] && ip -4 rule delete from ${IPV4_ADDRESS} table $FWMARK || true
+        [[ "${IPV6_ADDRESS}" != "" ]] && ip -6 rule delete from ${IPV6_ADDRESS} table $FWMARK || true
         if [[ $endpoint_is_ipv6 == TRUE ]]
         then
             ip -6 rule delete to $ENDPOINT table main || true
