@@ -14,11 +14,17 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <ifaddrs.h>
+#include <sys/ioctl.h>
+#include <net/route.h>
 #include <stdarg.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include "router_common.h"
 #include "local_router.skel.h"
+
+#ifndef RTF_UP
+#define RTF_UP 0x0001
+#endif
 
 static bool g_suppress_libbpf_log = false;
 
@@ -126,6 +132,444 @@ static void remove_lan_iface(struct lan_ifaces *list, const char *arg) {
     free(buf);
 }
 
+static inline bool has_ip6(const uint32_t ip6[4]) {
+    return (ip6[0] | ip6[1] | ip6[2] | ip6[3]) != 0;
+}
+
+#define OIF_DEV_FILENAME "oif_dev.txt"
+
+static void save_oif_dev(const char *pin_dir, const char *oif_dev) {
+    if (!pin_dir) return;
+
+    char path[512];
+    /* 1. Primary: Save directly into pinned router_config_map (fully supported on bpffs) */
+    snprintf(path, sizeof(path), "%s/router_config_map", pin_dir);
+    int cfg_fd = bpf_obj_get(path);
+    if (cfg_fd >= 0) {
+        uint32_t zero = 0;
+        struct router_config cfg = {0};
+        if (bpf_map_lookup_elem(cfg_fd, &zero, &cfg) == 0) {
+            if (oif_dev && oif_dev[0] != '\0') {
+                strncpy(cfg.oif_name, oif_dev, sizeof(cfg.oif_name) - 1);
+                cfg.oif_name[sizeof(cfg.oif_name) - 1] = '\0';
+            } else {
+                memset(cfg.oif_name, 0, sizeof(cfg.oif_name));
+            }
+            bpf_map_update_elem(cfg_fd, &zero, &cfg, BPF_ANY);
+        }
+        close(cfg_fd);
+
+        /* Keep fallback file in sync so stale files never persist */
+        snprintf(path, sizeof(path), "%s/%s", pin_dir, OIF_DEV_FILENAME);
+        if (!oif_dev || oif_dev[0] == '\0') {
+            unlink(path);
+        } else {
+            FILE *f = fopen(path, "w");
+            if (f) {
+                fprintf(f, "%s\n", oif_dev);
+                fclose(f);
+            }
+        }
+        return;
+    }
+
+    /* 2. Fallback for non-bpffs environments (e.g. unit tests in /tmp) */
+    snprintf(path, sizeof(path), "%s/%s", pin_dir, OIF_DEV_FILENAME);
+    if (!oif_dev || oif_dev[0] == '\0') {
+        unlink(path);
+        return;
+    }
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "%s\n", oif_dev);
+    fclose(f);
+}
+
+static int load_oif_dev(const char *pin_dir, char *oif_dev, size_t max_len) {
+    if (!pin_dir || !oif_dev || max_len == 0) return -1;
+    oif_dev[0] = '\0';
+
+    /* 1. Primary: Query pinned router_config_map (fully supported on bpffs) */
+    char path[512];
+    snprintf(path, sizeof(path), "%s/router_config_map", pin_dir);
+    int cfg_fd = bpf_obj_get(path);
+    if (cfg_fd >= 0) {
+        uint32_t zero = 0;
+        struct router_config cfg = {0};
+        if (bpf_map_lookup_elem(cfg_fd, &zero, &cfg) == 0) {
+            if (cfg.oif_name[0] != '\0') {
+                snprintf(oif_dev, max_len, "%s", cfg.oif_name);
+                close(cfg_fd);
+                return 0;
+            }
+            /* Fallback to IP match if oif_name is not populated (e.g. legacy map) */
+            if (cfg.oif_src_ip4 || has_ip6(cfg.oif_src_ip6)) {
+                struct ifaddrs *ifaddr, *ifa;
+                if (getifaddrs(&ifaddr) == 0) {
+                    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+                        if (!ifa->ifa_name || !ifa->ifa_addr) continue;
+                        if (cfg.oif_src_ip4 && ifa->ifa_addr->sa_family == AF_INET) {
+                            struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_addr;
+                            if (sin->sin_addr.s_addr == cfg.oif_src_ip4) {
+                                snprintf(oif_dev, max_len, "%s", ifa->ifa_name);
+                                freeifaddrs(ifaddr);
+                                close(cfg_fd);
+                                return 0;
+                            }
+                        }
+                        if (has_ip6(cfg.oif_src_ip6) && ifa->ifa_addr->sa_family == AF_INET6) {
+                            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ifa->ifa_addr;
+                            if (memcmp(&sin6->sin6_addr, cfg.oif_src_ip6, 16) == 0) {
+                                snprintf(oif_dev, max_len, "%s", ifa->ifa_name);
+                                freeifaddrs(ifaddr);
+                                close(cfg_fd);
+                                return 0;
+                            }
+                        }
+                    }
+                    freeifaddrs(ifaddr);
+                }
+            }
+        }
+        close(cfg_fd);
+        /* Authoritative map exists and is valid. If oif is not set, do NOT read stale files */
+        return -1;
+    }
+
+    /* 2. Fallback for non-bpffs environments (e.g. unit tests in /tmp) */
+    snprintf(path, sizeof(path), "%s/%s", pin_dir, OIF_DEV_FILENAME);
+    FILE *f = fopen(path, "r");
+    if (f) {
+        char line[IFNAMSIZ + 16];
+        if (fgets(line, sizeof(line), f)) {
+            char *t = trim(line);
+            if (*t) {
+                snprintf(oif_dev, max_len, "%s", t);
+                fclose(f);
+                return 0;
+            }
+        }
+        fclose(f);
+    }
+
+    return -1;
+}
+
+static bool is_interface_carrier_up(const char *ifname) {
+    if (!ifname || !*ifname) return false;
+
+    /* 1. Check operational carrier via sysfs if present */
+    char carrier_path[256];
+    snprintf(carrier_path, sizeof(carrier_path), "/sys/class/net/%s/carrier", ifname);
+    FILE *f = fopen(carrier_path, "r");
+    if (f) {
+        char val[16];
+        bool carrier_zero = false;
+        if (fgets(val, sizeof(val), f)) {
+            char *t = trim(val);
+            if (strcmp(t, "0") == 0) {
+                carrier_zero = true;
+            }
+        }
+        fclose(f);
+        if (carrier_zero) {
+            return false;
+        }
+    }
+
+    /* 2. Check flags via socket ioctl (SIOCGIFFLAGS) */
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock >= 0) {
+        struct ifreq ifr;
+        memset(&ifr, 0, sizeof(ifr));
+        strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+        int ret = ioctl(sock, SIOCGIFFLAGS, &ifr);
+        close(sock);
+        if (ret == 0) {
+            if (!(ifr.ifr_flags & IFF_UP) || !(ifr.ifr_flags & IFF_RUNNING)) {
+                return false;
+            }
+            return true;
+        }
+    }
+
+    /* 3. Fallback: getifaddrs */
+    struct ifaddrs *ifaddr, *ifa;
+    if (getifaddrs(&ifaddr) == 0) {
+        bool found = false;
+        bool ok = false;
+        for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+            if (ifa->ifa_name && strcmp(ifa->ifa_name, ifname) == 0) {
+                found = true;
+                if ((ifa->ifa_flags & IFF_UP) && (ifa->ifa_flags & IFF_RUNNING)) {
+                    ok = true;
+                    break;
+                }
+            }
+        }
+        freeifaddrs(ifaddr);
+        if (found) return ok;
+    }
+
+    return false;
+}
+
+static bool is_physical_interface(const char *ifname) {
+    if (!ifname || !*ifname) return false;
+    if (strcmp(ifname, "lo") == 0 || strncmp(ifname, "lo:", 3) == 0) return false;
+
+    /* Exclude known virtual/pseudo interfaces and VLAN subinterfaces */
+    if (strncmp(ifname, "wg", 2) == 0 ||
+        strncmp(ifname, "tun", 3) == 0 ||
+        strncmp(ifname, "tap", 3) == 0 ||
+        strncmp(ifname, "docker", 6) == 0 ||
+        strncmp(ifname, "br", 2) == 0 ||
+        strncmp(ifname, "bridge", 6) == 0 ||
+        strncmp(ifname, "virbr", 5) == 0 ||
+        strncmp(ifname, "veth", 4) == 0 ||
+        strncmp(ifname, "dummy", 5) == 0 ||
+        strncmp(ifname, "sit", 3) == 0 ||
+        strncmp(ifname, "ip6tnl", 6) == 0 ||
+        strncmp(ifname, "bond", 4) == 0 ||
+        strncmp(ifname, "gre", 3) == 0 ||
+        strncmp(ifname, "vxlan", 5) == 0 ||
+        strncmp(ifname, "ppp", 3) == 0 ||
+        strncmp(ifname, "vlan", 4) == 0 ||
+        strncmp(ifname, "macvlan", 7) == 0 ||
+        strchr(ifname, '.') != NULL) {
+        return false;
+    }
+
+    /* Check if /sys/class/net/<ifname>/device exists */
+    char path[256];
+    snprintf(path, sizeof(path), "/sys/class/net/%s/device", ifname);
+    if (access(path, F_OK) == 0) return true;
+
+    /* Common physical interface naming patterns */
+    if (strncmp(ifname, "eth", 3) == 0 ||
+        strncmp(ifname, "en", 2) == 0 ||
+        strncmp(ifname, "wl", 2) == 0 ||
+        strncmp(ifname, "ww", 2) == 0) {
+        return true;
+    }
+
+    return false;
+}
+
+static int count_active_physical_interfaces(void) {
+    struct if_nameindex *if_list = if_nameindex();
+    if (!if_list) return 0;
+
+    int count = 0;
+    for (struct if_nameindex *i = if_list; i->if_index && i->if_name; ++i) {
+        if (!is_physical_interface(i->if_name)) continue;
+        if (is_interface_carrier_up(i->if_name)) {
+            count++;
+        }
+    }
+    if_freenameindex(if_list);
+    return count;
+}
+
+static inline bool is_ipv4_default_route(uint32_t dest, uint32_t mask, uint32_t flags) {
+    return (dest == 0 && mask == 0 && (flags & RTF_UP));
+}
+
+static inline bool is_ipv6_default_route(const char *d_ip, const char *d_len, uint32_t flags) {
+    if (!d_ip || !d_len) return false;
+    if (strcmp(d_len, "00") != 0) return false;
+    if (strcmp(d_ip, "00000000000000000000000000000000") != 0) return false;
+    if (!(flags & RTF_UP)) return false;
+    return true;
+}
+
+static bool is_auto_interface_keyword(const char *name) {
+    if (!name) return false;
+    return (strcasecmp(name, "auto") == 0 ||
+            strcasecmp(name, "default") == 0 ||
+            strcasecmp(name, "primary") == 0);
+}
+
+#ifdef UNIT_TESTING
+int (*g_mock_get_default_interface)(const char *exclude_oif, char *out_ifname, size_t max_len) = NULL;
+#endif
+
+static int get_default_interface(const char *exclude_oif, char *out_ifname, size_t max_len) {
+#ifdef UNIT_TESTING
+    if (g_mock_get_default_interface) {
+        return g_mock_get_default_interface(exclude_oif, out_ifname, max_len);
+    }
+#endif
+    if (!out_ifname || max_len == 0) return -1;
+    out_ifname[0] = '\0';
+
+    #define SHOULD_EXCLUDE(name) \
+        (strcmp(name, "lo") == 0 || \
+         (exclude_oif && strcmp(name, exclude_oif) == 0) || \
+         strncmp(name, "wg", 2) == 0)
+
+    /* 1. Try IPv4 default route via /proc/net/route */
+    FILE *f = fopen("/proc/net/route", "r");
+    if (f) {
+        char line[256];
+        char best_ifname[IFNAMSIZ] = {0};
+        uint32_t lowest_metric = 0xFFFFFFFF;
+        bool found = false;
+
+        /* Skip header line */
+        if (fgets(line, sizeof(line), f)) {
+            while (fgets(line, sizeof(line), f)) {
+                char iface[IFNAMSIZ];
+                uint32_t dest, flags, metric, mask;
+                if (sscanf(line, "%15s %x %*x %x %*x %*x %x %x", iface, &dest, &flags, &metric, &mask) == 5) {
+                    if (is_ipv4_default_route(dest, mask, flags)) {
+                        if (SHOULD_EXCLUDE(iface)) continue;
+                        if (!is_interface_carrier_up(iface)) continue;
+                        if (metric < lowest_metric || !found) {
+                            lowest_metric = metric;
+                            snprintf(best_ifname, sizeof(best_ifname), "%s", iface);
+                            found = true;
+                        }
+                    }
+                }
+            }
+        }
+        fclose(f);
+        if (found) {
+            snprintf(out_ifname, max_len, "%s", best_ifname);
+            return 0;
+        }
+    }
+
+    /* 2. Try IPv6 default route via /proc/net/ipv6_route */
+    f = fopen("/proc/net/ipv6_route", "r");
+    if (f) {
+        char line[512];
+        char best_ifname[IFNAMSIZ] = {0};
+        uint32_t lowest_metric = 0xFFFFFFFF;
+        bool found = false;
+
+        while (fgets(line, sizeof(line), f)) {
+            char d_ip[33], d_len[3], s_ip[33], s_len[3], nh[33];
+            uint32_t metric, refcnt, use, flags;
+            char iface[IFNAMSIZ];
+
+            int fields = sscanf(line, "%32s %2s %32s %2s %32s %x %x %x %x %15s",
+                                d_ip, d_len, s_ip, s_len, nh, &metric, &refcnt, &use, &flags, iface);
+            if (fields == 10) {
+                if (is_ipv6_default_route(d_ip, d_len, flags)) {
+                    if (SHOULD_EXCLUDE(iface)) continue;
+                    if (!is_interface_carrier_up(iface)) continue;
+                    if (metric < lowest_metric || !found) {
+                        lowest_metric = metric;
+                        snprintf(best_ifname, sizeof(best_ifname), "%s", iface);
+                        found = true;
+                    }
+                }
+            }
+        }
+        fclose(f);
+        if (found) {
+            snprintf(out_ifname, max_len, "%s", best_ifname);
+            return 0;
+        }
+    }
+
+    /* 3. Fallback: Active non-loopback UP & RUNNING interface with an IP (prefer physical interfaces) */
+    struct ifaddrs *ifaddr, *ifa;
+    if (getifaddrs(&ifaddr) == 0) {
+        char fallback_candidate[IFNAMSIZ] = {0};
+        bool found_candidate = false;
+
+        for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+            if (!ifa->ifa_name || !ifa->ifa_addr) continue;
+            if (SHOULD_EXCLUDE(ifa->ifa_name)) continue;
+            if ((ifa->ifa_flags & IFF_UP) && (ifa->ifa_flags & IFF_RUNNING)) {
+                if (!is_interface_carrier_up(ifa->ifa_name)) continue;
+                if (ifa->ifa_addr->sa_family == AF_INET || ifa->ifa_addr->sa_family == AF_INET6) {
+                    if (is_physical_interface(ifa->ifa_name)) {
+                        snprintf(out_ifname, max_len, "%s", ifa->ifa_name);
+                        freeifaddrs(ifaddr);
+                        return 0;
+                    }
+                    if (!found_candidate) {
+                        snprintf(fallback_candidate, sizeof(fallback_candidate), "%s", ifa->ifa_name);
+                        found_candidate = true;
+                    }
+                }
+            }
+        }
+        freeifaddrs(ifaddr);
+        if (found_candidate) {
+            snprintf(out_ifname, max_len, "%s", fallback_candidate);
+            return 0;
+        }
+    }
+
+    #undef SHOULD_EXCLUDE
+    return -1;
+}
+
+static int resolve_lan_ifaces(struct lan_ifaces *list, const char *exclude_oif) {
+    if (!list) return 0;
+    char def_if[IFNAMSIZ] = {0};
+    bool def_resolved = false;
+    bool resolution_failed = false;
+
+    for (int i = 0; i < list->count; i++) {
+        if (is_auto_interface_keyword(list->names[i])) {
+            const char *original_keyword = list->names[i];
+            if (!def_resolved) {
+                if (get_default_interface(exclude_oif, def_if, sizeof(def_if)) != 0) {
+                    fprintf(stderr, "Error: Could not auto-detect default network interface (no default route or active physical interface found)\n");
+                    resolution_failed = true;
+                    for (int j = i; j < list->count - 1; j++) {
+                        memcpy(list->names[j], list->names[j + 1], IFNAMSIZ);
+                    }
+                    list->count--;
+                    i--;
+                    continue;
+                }
+                def_resolved = true;
+                printf("[*] Auto-detected default interface for TC ingress: '%s'\n", def_if);
+
+                int phys_count = count_active_physical_interfaces();
+                bool ppp_uplink = (strncmp(def_if, "ppp", 3) == 0);
+                if (phys_count > 1 || (ppp_uplink && phys_count >= 1)) {
+                    fprintf(stderr, "Warning: Multi-interface host detected (%d active physical LAN/WAN interface(s)%s). "
+                                    "'%s' resolved to WAN/default-route interface '%s'. "
+                                    "In a multi-NIC router setup, using 'auto' attaches TC ingress to WAN instead of LAN. "
+                                    "You should explicitly specify the LAN interface (e.g. '--iif eth1') to avoid routing inversion!\n",
+                            phys_count, ppp_uplink ? " with PPP uplink" : "", original_keyword, def_if);
+                }
+            }
+            snprintf(list->names[i], IFNAMSIZ, "%s", def_if);
+        }
+        if (exclude_oif && strcmp(list->names[i], exclude_oif) == 0) {
+            fprintf(stderr, "Error: Inbound LAN interface '%s' cannot be identical to outbound interface (--oif)!\n", list->names[i]);
+            return -1;
+        }
+    }
+
+    /* Deduplicate interface names */
+    for (int i = 0; i < list->count; i++) {
+        for (int j = i + 1; j < list->count; j++) {
+            if (strcmp(list->names[i], list->names[j]) == 0) {
+                for (int k = j; k < list->count - 1; k++) {
+                    memcpy(list->names[k], list->names[k + 1], IFNAMSIZ);
+                }
+                list->count--;
+                j--;
+            }
+        }
+    }
+
+    if (resolution_failed && list->count == 0) {
+        return -1;
+    }
+    return 0;
+}
+
 static int get_or_create_lan_map(const char *pin_dir) {
     char path[512];
     snprintf(path, sizeof(path), "%s/%s", pin_dir, LAN_IFACES_FILENAME);
@@ -181,6 +625,22 @@ static void save_lan_ifaces(const char *pin_dir, const struct lan_ifaces *list) 
                 bpf_map_update_elem(map_fd, k, &ifidx, BPF_ANY);
             }
         }
+        /* Keep fallback file in sync so stale files never persist */
+        char path[512];
+        snprintf(path, sizeof(path), "%s/%s.txt", pin_dir, LAN_IFACES_FILENAME);
+        if (!list || list->count == 0) {
+            unlink(path);
+            snprintf(path, sizeof(path), "%s/lan_ifaces.txt", pin_dir);
+            unlink(path);
+        } else {
+            FILE *f = fopen(path, "w");
+            if (f) {
+                for (int i = 0; i < list->count; i++) {
+                    fprintf(f, "%s\n", list->names[i]);
+                }
+                fclose(f);
+            }
+        }
         close(map_fd);
         return;
     }
@@ -189,6 +649,8 @@ static void save_lan_ifaces(const char *pin_dir, const struct lan_ifaces *list) 
     char path[512];
     snprintf(path, sizeof(path), "%s/%s.txt", pin_dir, LAN_IFACES_FILENAME);
     if (!list || list->count == 0) {
+        unlink(path);
+        snprintf(path, sizeof(path), "%s/lan_ifaces.txt", pin_dir);
         unlink(path);
         return;
     }
@@ -355,7 +817,7 @@ static bool query_tc_filter(int ifindex, uint32_t handle, uint32_t priority, uin
         if (expected_prog_id > 0) {
             return opts.prog_id == expected_prog_id;
         }
-        return true;
+        return false; /* Cannot verify prog_id with certainty; fall back to check_tc_filter_cmd for program name */
     }
     return false;
 }
@@ -422,7 +884,11 @@ static bool check_tc_filter_cmd(const char *ifname, uint32_t expected_prog_id) {
     return found;
 }
 
-static bool is_tc_ingress_attached(const char *ifname, uint32_t expected_prog_id) {
+static bool is_tc_ingress_attached_ext(const char *ifname, uint32_t expected_prog_id, bool allow_cmd_fallback) {
+    if (!ifname || expected_prog_id == 0) {
+        return false;
+    }
+
     unsigned int ifindex = if_nametoindex(ifname);
     if (ifindex == 0) {
         return false;
@@ -440,8 +906,15 @@ static bool is_tc_ingress_attached(const char *ifname, uint32_t expected_prog_id
     if (query_tc_filter((int)ifindex, 1, 0, expected_prog_id)) return true;
     if (query_tc_filter((int)ifindex, 0, 0, expected_prog_id)) return true;
 
-    /* 4. Robust fallback via direct tc command inspection without shell */
+    /* 4. Robust fallback via direct tc command inspection without shell (never in passive scanning) */
+    if (!allow_cmd_fallback) {
+        return false;
+    }
     return check_tc_filter_cmd(ifname, expected_prog_id);
+}
+
+static bool is_tc_ingress_attached(const char *ifname, uint32_t expected_prog_id) {
+    return is_tc_ingress_attached_ext(ifname, expected_prog_id, true);
 }
 
 static int ensure_dir(const char *path) {
@@ -456,18 +929,22 @@ static int ensure_dir(const char *path) {
     for (char *p = tmp + 1; *p; p++) {
         if (*p == '/') {
             *p = '\0';
-            if (mkdir(tmp, dir_mode) != 0 && errno != EEXIST) {
+            if (mkdir(tmp, dir_mode) != 0) {
+                if (errno != EEXIST)
+                    return -errno;
                 struct stat st;
                 if (stat(tmp, &st) != 0 || !S_ISDIR(st.st_mode))
-                    return -errno;
+                    return -ENOTDIR;
             }
             *p = '/';
         }
     }
-    if (mkdir(tmp, dir_mode) != 0 && errno != EEXIST) {
+    if (mkdir(tmp, dir_mode) != 0) {
+        if (errno != EEXIST)
+            return -errno;
         struct stat st;
         if (stat(tmp, &st) != 0 || !S_ISDIR(st.st_mode))
-            return -errno;
+            return -ENOTDIR;
     }
     return 0;
 }
@@ -1127,7 +1604,7 @@ static int do_stop(const char *pin_dir, const struct lan_ifaces *cli_lan_ifaces)
     struct if_nameindex *if_list = if_nameindex();
     if (if_list) {
         for (struct if_nameindex *i = if_list; i->if_index && i->if_name; ++i) {
-            if (is_tc_ingress_attached(i->if_name, our_prog_id)) {
+            if (is_tc_ingress_attached_ext(i->if_name, our_prog_id, false)) {
                 add_lan_iface(&to_detach, i->if_name);
             }
         }
@@ -1142,6 +1619,8 @@ static int do_stop(const char *pin_dir, const struct lan_ifaces *cli_lan_ifaces)
     snprintf(txt_path, sizeof(txt_path), "%s/%s.txt", pin_dir, LAN_IFACES_FILENAME);
     unlink(txt_path);
     snprintf(txt_path, sizeof(txt_path), "%s/lan_ifaces.txt", pin_dir);
+    unlink(txt_path);
+    snprintf(txt_path, sizeof(txt_path), "%s/%s", pin_dir, OIF_DEV_FILENAME);
     unlink(txt_path);
 
     /* 2. Unpin TC ingress program */
@@ -1168,10 +1647,6 @@ static int do_stop(const char *pin_dir, const struct lan_ifaces *cli_lan_ifaces)
     }
     printf("[✔] Successfully stopped and unpinned.\n");
     return 0;
-}
-
-static inline bool has_ip6(const uint32_t ip6[4]) {
-    return (ip6[0] | ip6[1] | ip6[2] | ip6[3]) != 0;
 }
 
 static int get_interface_ips(const char *ifname, uint32_t *ip4_be, uint32_t ip6_be[4]) {
@@ -1260,6 +1735,22 @@ static int apply_nft_rules(const char *rule_file, const char *wg_endpoint_str, c
         return -1;
     }
 
+    if (oif_dev && strlen(oif_dev) > 0) {
+        struct lan_ifaces cur_lan = {0};
+        load_lan_ifaces(pin_dir, &cur_lan);
+        for (int i = 0; i < cur_lan.count; i++) {
+            if (strcmp(cur_lan.names[i], oif_dev) == 0) {
+                fprintf(stderr, "Error: Outbound interface '%s' cannot be identical to inbound LAN interface!\n", oif_dev);
+                close(cfg_fd);
+                close(ep_fd);
+                close(v4_fd);
+                close(v6_fd);
+                free_rule_collector(&rc);
+                return -1;
+            }
+        }
+    }
+
     rc.v4_count = deduplicate_v4(rc.v4_keys, rc.v4_count);
     rc.v6_count = deduplicate_v6(rc.v6_keys, rc.v6_count);
 
@@ -1296,6 +1787,8 @@ static int apply_nft_rules(const char *rule_file, const char *wg_endpoint_str, c
     cfg.enabled = 1;
 
     if (oif_dev && strlen(oif_dev) > 0) {
+        strncpy(cfg.oif_name, oif_dev, sizeof(cfg.oif_name) - 1);
+        cfg.oif_name[sizeof(cfg.oif_name) - 1] = '\0';
         if (get_interface_ips(oif_dev, &cfg.oif_src_ip4, cfg.oif_src_ip6) == 0) {
             char buf4[INET_ADDRSTRLEN] = "none";
             char buf6[INET6_ADDRSTRLEN] = "none";
@@ -1309,19 +1802,34 @@ static int apply_nft_rules(const char *rule_file, const char *wg_endpoint_str, c
             cfg.oif_src_ip4 = 0;
             memset(cfg.oif_src_ip6, 0, sizeof(cfg.oif_src_ip6));
         }
-    } else if (cfg.oif_src_ip4 || has_ip6(cfg.oif_src_ip6)) {
+        bpf_map_update_elem(cfg_fd, &zero, &cfg, BPF_ANY);
+        save_oif_dev(pin_dir, oif_dev);
+    } else if (cfg.oif_src_ip4 || has_ip6(cfg.oif_src_ip6) || cfg.oif_name[0] != '\0') {
+        if (cfg.oif_name[0] != '\0') {
+            /* Try re-probing interface IP in case interface acquired/changed IP (e.g. WireGuard handshake, DHCP) */
+            uint32_t new_ip4 = 0;
+            uint32_t new_ip6[4] = {0};
+            if (get_interface_ips(cfg.oif_name, &new_ip4, new_ip6) == 0) {
+                cfg.oif_src_ip4 = new_ip4;
+                memcpy(cfg.oif_src_ip6, new_ip6, sizeof(cfg.oif_src_ip6));
+            }
+        }
         char buf4[INET_ADDRSTRLEN] = "none";
         char buf6[INET6_ADDRSTRLEN] = "none";
         if (cfg.oif_src_ip4)
             inet_ntop(AF_INET, &cfg.oif_src_ip4, buf4, sizeof(buf4));
         if (has_ip6(cfg.oif_src_ip6))
             inet_ntop(AF_INET6, cfg.oif_src_ip6, buf6, sizeof(buf6));
-        printf("  -> Preserving existing Outbound Interface Source IPs: IPv4=%s, IPv6=%s\n", buf4, buf6);
+        if (cfg.oif_name[0] != '\0') {
+            printf("  -> Preserving existing Outbound Interface (oif: %s) Source IPs: IPv4=%s, IPv6=%s\n", cfg.oif_name, buf4, buf6);
+        } else {
+            printf("  -> Preserving existing Outbound Interface Source IPs: IPv4=%s, IPv6=%s\n", buf4, buf6);
+        }
+        bpf_map_update_elem(cfg_fd, &zero, &cfg, BPF_ANY);
     } else {
         printf("  -> Outbound Interface (oif): None (UDP source IP injection disabled)\n");
+        bpf_map_update_elem(cfg_fd, &zero, &cfg, BPF_ANY);
     }
-
-    bpf_map_update_elem(cfg_fd, &zero, &cfg, BPF_ANY);
     printf("  -> Configured FWMARK: 0x%x (%u)\n", rc.fwmark, rc.fwmark);
 
     /* 2. Update WireGuard Endpoint */
@@ -1378,6 +1886,14 @@ static int do_start(const char *cgroup_path, const char *rule_file, const char *
 
     /* Clean up any leftover pinned objects and TC filters from previous runs */
     do_stop(pin_dir, lan_list);
+
+    /* Re-ensure pin_dir exists because do_stop removes empty directories */
+    err = ensure_dir(pin_dir);
+    if (err != 0) {
+        fprintf(stderr, "Error: Failed to recreate bpffs dir %s: %s\n", pin_dir, strerror(-err));
+        close(cgroup_fd);
+        return 1;
+    }
 
     /* Also clean up any accidental root bpffs pins from earlier versions */
     unlink("/sys/fs/bpf/wg_endpoint_map");
@@ -1505,7 +2021,7 @@ cleanup_rollback:
     return 1;
 }
 
-static int do_add_iif(const char *if_str, const char *pin_dir) {
+static int do_add_iif(const struct lan_ifaces *lan_list, const char *pin_dir) {
     if (!pin_dir) pin_dir = DEFAULT_PIN_DIR;
     char prog_path[512];
     snprintf(prog_path, sizeof(prog_path), "%s/%s", pin_dir, TC_PROG_FILENAME);
@@ -1525,7 +2041,7 @@ static int do_add_iif(const char *if_str, const char *pin_dir) {
     struct if_nameindex *if_list = if_nameindex();
     if (if_list) {
         for (struct if_nameindex *i = if_list; i->if_index && i->if_name; ++i) {
-            if (is_tc_ingress_attached(i->if_name, our_prog_id)) {
+            if (is_tc_ingress_attached_ext(i->if_name, our_prog_id, false)) {
                 add_lan_iface(&cur_list, i->if_name);
             }
         }
@@ -1533,10 +2049,17 @@ static int do_add_iif(const char *if_str, const char *pin_dir) {
     }
 
     struct lan_ifaces to_add = {0};
-    add_lan_iface(&to_add, if_str);
+    if (lan_list) {
+        for (int i = 0; i < lan_list->count; i++) {
+            add_lan_iface(&to_add, lan_list->names[i]);
+        }
+    }
 
-    if (to_add.count == 0) {
-        fprintf(stderr, "Error: No valid interface names specified.\n");
+    char saved_oif[IFNAMSIZ] = {0};
+    const char *exclude_oif = (load_oif_dev(pin_dir, saved_oif, sizeof(saved_oif)) == 0 && saved_oif[0] != '\0') ? saved_oif : NULL;
+
+    if (resolve_lan_ifaces(&to_add, exclude_oif) != 0 || to_add.count == 0) {
+        fprintf(stderr, "Error: No valid interface names specified or resolved.\n");
         close(prog_fd);
         return 1;
     }
@@ -1559,7 +2082,7 @@ static int do_add_iif(const char *if_str, const char *pin_dir) {
     return 1;
 }
 
-static int do_del_iif(const char *if_str, const char *pin_dir) {
+static int do_del_iif(const struct lan_ifaces *lan_list, const char *pin_dir) {
     if (!pin_dir) pin_dir = DEFAULT_PIN_DIR;
 
     uint32_t our_prog_id = get_pinned_tc_prog_id(pin_dir);
@@ -1571,29 +2094,82 @@ static int do_del_iif(const char *if_str, const char *pin_dir) {
     struct if_nameindex *if_list = if_nameindex();
     if (if_list) {
         for (struct if_nameindex *i = if_list; i->if_index && i->if_name; ++i) {
-            if (is_tc_ingress_attached(i->if_name, our_prog_id)) {
+            if (is_tc_ingress_attached_ext(i->if_name, our_prog_id, false)) {
                 add_lan_iface(&cur_list, i->if_name);
             }
         }
         if_freenameindex(if_list);
     }
 
-    struct lan_ifaces to_del = {0};
-    add_lan_iface(&to_del, if_str);
-
-    if (to_del.count == 0) {
-        fprintf(stderr, "Error: No valid interface names specified.\n");
+    if (!lan_list || lan_list->count == 0) {
+        fprintf(stderr, "Error: missing interface argument for del-iif. Specify interface name(s) or 'all'.\n");
         return 1;
     }
 
+    for (int i = 0; i < lan_list->count; i++) {
+        if (is_auto_interface_keyword(lan_list->names[i])) {
+            fprintf(stderr, "Error: '%s' is not supported for del-iif to prevent accidentally detaching WAN. Specify explicit interface name(s) (e.g. 'del-iif eth1') or 'all'.\n", lan_list->names[i]);
+            return 1;
+        }
+    }
+
+    bool del_all = false;
+    for (int i = 0; i < lan_list->count; i++) {
+        if (strcasecmp(lan_list->names[i], "all") == 0) {
+            del_all = true;
+            break;
+        }
+    }
+
+    if (del_all) {
+        if (cur_list.count == 0) {
+            printf("[-] No tracked or attached LAN interfaces found to detach.\n");
+            return 0;
+        }
+        int detached = 0;
+        for (int i = 0; i < cur_list.count; i++) {
+            tc_detach_interface(cur_list.names[i]);
+            printf("[-] Detached TC ingress filter from '%s'\n", cur_list.names[i]);
+            detached++;
+        }
+        cur_list.count = 0;
+        save_lan_ifaces(pin_dir, &cur_list);
+        printf("[✔] Successfully detached and removed %d LAN interface(s)!\n", detached);
+        return 0;
+    }
+
+    struct lan_ifaces to_del = {0};
+    for (int i = 0; i < lan_list->count; i++) {
+        add_lan_iface(&to_del, lan_list->names[i]);
+    }
+
+    int detached = 0;
     for (int i = 0; i < to_del.count; i++) {
-        tc_detach_interface(to_del.names[i]);
-        remove_lan_iface(&cur_list, to_del.names[i]);
-        printf("[-] Detached TC ingress filter from '%s'\n", to_del.names[i]);
+        const char *name = to_del.names[i];
+        bool was_tracked = false;
+        for (int j = 0; j < cur_list.count; j++) {
+            if (strcmp(cur_list.names[j], name) == 0) {
+                was_tracked = true;
+                break;
+            }
+        }
+        bool was_attached = is_tc_ingress_attached(name, our_prog_id);
+        if (!was_tracked && !was_attached) {
+            printf("[-] Interface '%s' is not attached or tracked; skipping.\n", name);
+            continue;
+        }
+        tc_detach_interface(name);
+        remove_lan_iface(&cur_list, name);
+        printf("[-] Detached TC ingress filter from '%s'\n", name);
+        detached++;
     }
 
     save_lan_ifaces(pin_dir, &cur_list);
-    printf("[✔] Successfully detached and removed %d LAN interface(s)!\n", to_del.count);
+    if (detached > 0) {
+        printf("[✔] Successfully detached and removed %d LAN interface(s)!\n", detached);
+    } else {
+        printf("[-] No specified interfaces were currently attached or tracked.\n");
+    }
     return 0;
 }
 
@@ -1620,11 +2196,24 @@ static int do_set_oif(const char *ifname, const char *pin_dir) {
         return 1;
     }
 
-    if (get_interface_ips(ifname, &cfg.oif_src_ip4, cfg.oif_src_ip6) != 0) {
-        fprintf(stderr, "Error: Failed to find interface '%s' or retrieve its IP addresses.\n", ifname);
-        close(cfg_fd);
-        return 1;
+    struct lan_ifaces cur_lan = {0};
+    load_lan_ifaces(pin_dir, &cur_lan);
+    for (int i = 0; i < cur_lan.count; i++) {
+        if (strcmp(cur_lan.names[i], ifname) == 0) {
+            fprintf(stderr, "Error: Outbound interface '%s' cannot be identical to currently attached inbound LAN interface!\n", ifname);
+            close(cfg_fd);
+            return 1;
+        }
     }
+
+    if (get_interface_ips(ifname, &cfg.oif_src_ip4, cfg.oif_src_ip6) != 0) {
+        fprintf(stderr, "  [!] Warning: Outbound interface '%s' not found or has no valid IPv4/IPv6 assigned, skipping source IP binding (fwmark-only mode active).\n", ifname);
+        cfg.oif_src_ip4 = 0;
+        memset(cfg.oif_src_ip6, 0, sizeof(cfg.oif_src_ip6));
+    }
+
+    strncpy(cfg.oif_name, ifname, sizeof(cfg.oif_name) - 1);
+    cfg.oif_name[sizeof(cfg.oif_name) - 1] = '\0';
 
     if (bpf_map_update_elem(cfg_fd, &zero, &cfg, BPF_ANY) != 0) {
         fprintf(stderr, "Error: Failed to update router_config_map: %s\n", strerror(errno));
@@ -1632,6 +2221,7 @@ static int do_set_oif(const char *ifname, const char *pin_dir) {
         return 1;
     }
     close(cfg_fd);
+    save_oif_dev(pin_dir, ifname);
 
     char buf4[INET_ADDRSTRLEN] = "none";
     char buf6[INET6_ADDRSTRLEN] = "none";
@@ -1665,6 +2255,7 @@ static int do_del_oif(const char *pin_dir) {
 
     cfg.oif_src_ip4 = 0;
     memset(cfg.oif_src_ip6, 0, sizeof(cfg.oif_src_ip6));
+    memset(cfg.oif_name, 0, sizeof(cfg.oif_name));
 
     if (bpf_map_update_elem(cfg_fd, &zero, &cfg, BPF_ANY) != 0) {
         fprintf(stderr, "Error: Failed to update router_config_map: %s\n", strerror(errno));
@@ -1672,6 +2263,7 @@ static int do_del_oif(const char *pin_dir) {
         return 1;
     }
     close(cfg_fd);
+    save_oif_dev(pin_dir, NULL);
 
     printf("[✔] Outbound interface (oif) removed (UDP source IP injection disabled, fwmark-only mode active)\n");
     return 0;
@@ -1742,15 +2334,11 @@ static int do_status(const char *pin_dir) {
     struct if_nameindex *if_list = if_nameindex();
     if (if_list) {
         for (struct if_nameindex *i = if_list; i->if_index && i->if_name; ++i) {
-            if (is_tc_ingress_attached(i->if_name, our_prog_id)) {
+            if (is_tc_ingress_attached_ext(i->if_name, our_prog_id, false)) {
                 add_lan_iface(&lan_list, i->if_name);
             }
         }
         if_freenameindex(if_list);
-        /* Sync discover results back into persistent map */
-        if (lan_list.count > 0) {
-            save_lan_ifaces(pin_dir, &lan_list);
-        }
     }
 
     if (lan_list.count > 0) {
@@ -1779,14 +2367,18 @@ static int do_status(const char *pin_dir) {
         struct router_config cfg = {0}; /* Zero-init protects against cross-version stack garbage */
         if (bpf_map_lookup_elem(cfg_fd, &zero, &cfg) == 0) {
             printf("  Enabled: %s, FWMARK: 0x%x (%u)\n", cfg.enabled ? "true" : "false", cfg.fwmark, cfg.fwmark);
-            if (cfg.oif_src_ip4 || has_ip6(cfg.oif_src_ip6)) {
+            if (cfg.oif_src_ip4 || has_ip6(cfg.oif_src_ip6) || cfg.oif_name[0] != '\0') {
                 char buf4[INET_ADDRSTRLEN] = "none";
                 char buf6[INET6_ADDRSTRLEN] = "none";
                 if (cfg.oif_src_ip4)
                     inet_ntop(AF_INET, &cfg.oif_src_ip4, buf4, sizeof(buf4));
                 if (has_ip6(cfg.oif_src_ip6))
                     inet_ntop(AF_INET6, cfg.oif_src_ip6, buf6, sizeof(buf6));
-                printf("  UDP Injected Egress IPs (oif): IPv4=%s, IPv6=%s\n", buf4, buf6);
+                if (cfg.oif_name[0] != '\0') {
+                    printf("  UDP Injected Egress IPs (oif: %s): IPv4=%s, IPv6=%s\n", cfg.oif_name, buf4, buf6);
+                } else {
+                    printf("  UDP Injected Egress IPs (oif): IPv4=%s, IPv6=%s\n", buf4, buf6);
+                }
             } else {
                 printf("  UDP Injected Egress IPs (oif): Disabled (fwmark-only mode)\n");
             }
@@ -1854,11 +2446,12 @@ static void print_usage(const char *prog) {
     printf("                          --fwmark <mark>         (optional override)\n");
     printf("                          --oif <iface>           (optional outbound interface to bind UDP source IP, e.g. wg0)\n");
     printf("                          --iif <iface>           (optional inbound/LAN interfaces for TC ingress,\n");
-    printf("                                                   can be repeated or comma-separated, e.g. eth1,eth2;\n");
-    printf("                                                   alias: --lan-if)\n\n");
+    printf("                                                   can be 'auto'/'default'/'primary' to auto-detect default route interface,\n");
+    printf("                                                   or repeated/comma-separated, e.g. --iif auto, --iif eth1,eth2; alias: --lan-if)\n\n");
     printf("  stop           Detach eBPF programs, TC ingress filters, and remove pinned objects\n");
     printf("                 Options: --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n");
-    printf("                          --iif <iface>           (optional explicit inbound/LAN interfaces to detach; alias: --lan-if)\n\n");
+    printf("                          --iif <iface>           (optional explicit inbound/LAN interfaces to detach;\n");
+    printf("                                                   can be 'auto'/'default'/'primary'; alias: --lan-if)\n\n");
     printf("  reload         Hot-reload nftables rule file into BPF maps (no detach)\n");
     printf("                 Options: --rule-file <var.nft>   (required)\n");
     printf("                          --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n");
@@ -1879,17 +2472,16 @@ static void print_usage(const char *prog) {
     printf("                 Usage:   %s del-oif [--pin-dir <path>]\n\n", prog);
     printf("  add-iif        Dynamically attach TC ingress filter to inbound/LAN interface(s) (alias: add-if)\n");
     printf("                 Options: --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n");
-    printf("                 Usage:   %s add-iif <iface[,iface2]> [--pin-dir <path>]\n\n", prog);
+    printf("                 Usage:   %s add-iif <iface[,iface2]|auto|default|primary> [--pin-dir <path>]\n\n", prog);
     printf("  del-iif        Dynamically detach TC ingress filter from inbound/LAN interface(s) (alias: del-if)\n");
     printf("                 Options: --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n");
-    printf("                 Usage:   %s del-iif <iface[,iface2]> [--pin-dir <path>]\n\n", prog);
+    printf("                 Usage:   %s del-iif <iface[,iface2]|all> [--pin-dir <path>]\n\n", prog);
     printf("  status         Show current eBPF router status, LAN interfaces, and map statistics\n");
     printf("                 Options: --pin-dir <path>        (default: /sys/fs/bpf/wg_routing)\n");
     printf("                 Usage:   %s status [--pin-dir <path>]\n", prog);
 }
 
-#ifndef UNIT_TESTING
-int main(int argc, char **argv) {
+int router_ctl_main(int argc, char **argv) {
     libbpf_set_print(libbpf_print_fn);
 
     if (argc < 2) {
@@ -1899,6 +2491,11 @@ int main(int argc, char **argv) {
 
     const char *cmd = argv[1];
     const char *pin_dir = DEFAULT_PIN_DIR;
+
+    if (strcmp(cmd, "--help") == 0 || strcmp(cmd, "-h") == 0 || strcmp(cmd, "help") == 0) {
+        print_usage(argv[0]);
+        return 0;
+    }
 
     if (strcmp(cmd, "start") == 0 || strcmp(cmd, "load") == 0) {
         const char *cgroup_path = DEFAULT_CGROUP_PATH;
@@ -1910,26 +2507,29 @@ int main(int argc, char **argv) {
 
         for (int i = 2; i < argc; i++) {
             if (strcmp(argv[i], "--cgroup-path") == 0) {
-                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
+                if (i + 1 >= argc || argv[i + 1][0] == '-') { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 cgroup_path = argv[++i];
             } else if (strcmp(argv[i], "--pin-dir") == 0) {
-                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
+                if (i + 1 >= argc || argv[i + 1][0] == '-') { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 pin_dir = argv[++i];
             } else if (strcmp(argv[i], "--rule-file") == 0) {
-                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
+                if (i + 1 >= argc || argv[i + 1][0] == '-') { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 rule_file = argv[++i];
             } else if (strcmp(argv[i], "--wg-endpoint") == 0 || strcmp(argv[i], "--endpoint") == 0) {
-                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
+                if (i + 1 >= argc || argv[i + 1][0] == '-') { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 wg_endpoint = argv[++i];
             } else if (strcmp(argv[i], "--fwmark") == 0) {
-                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
+                if (i + 1 >= argc || argv[i + 1][0] == '-') { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 fwmark = argv[++i];
             } else if (strcmp(argv[i], "--oif") == 0 || strcmp(argv[i], "--egress-dev") == 0 || strcmp(argv[i], "--wg-dev") == 0) {
-                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
+                if (i + 1 >= argc || argv[i + 1][0] == '-') { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 oif_dev = argv[++i];
             } else if (strcmp(argv[i], "--iif") == 0 || strcmp(argv[i], "--lan-if") == 0 || strcmp(argv[i], "--forward-if") == 0 ||
                        strcmp(argv[i], "--lan-interface") == 0) {
-                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
+                if (i + 1 >= argc || argv[i + 1][0] == '-') {
+                    fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]);
+                    return 1;
+                }
                 add_lan_iface(&lan_list, argv[++i]);
             } else {
                 fprintf(stderr, "Unknown argument '%s'\n", argv[i]);
@@ -1937,21 +2537,32 @@ int main(int argc, char **argv) {
                 return 1;
             }
         }
+        if (resolve_lan_ifaces(&lan_list, oif_dev) != 0) {
+            return 1;
+        }
         return do_start(cgroup_path, rule_file, wg_endpoint, fwmark, pin_dir, &lan_list, oif_dev);
     } else if (strcmp(cmd, "stop") == 0 || strcmp(cmd, "unload") == 0) {
         struct lan_ifaces cli_lan = {0};
         for (int i = 2; i < argc; i++) {
             if (strcmp(argv[i], "--pin-dir") == 0) {
-                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
+                if (i + 1 >= argc || argv[i + 1][0] == '-') { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 pin_dir = argv[++i];
             } else if (strcmp(argv[i], "--iif") == 0 || strcmp(argv[i], "--lan-if") == 0 || strcmp(argv[i], "--forward-if") == 0 ||
                        strcmp(argv[i], "--lan-interface") == 0) {
-                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
+                if (i + 1 >= argc || argv[i + 1][0] == '-') {
+                    fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]);
+                    return 1;
+                }
                 add_lan_iface(&cli_lan, argv[++i]);
             } else {
                 fprintf(stderr, "Unknown argument '%s'\n", argv[i]);
                 print_usage(argv[0]);
                 return 1;
+            }
+        }
+        if (cli_lan.count > 0) {
+            if (resolve_lan_ifaces(&cli_lan, NULL) != 0 || cli_lan.count == 0) {
+                fprintf(stderr, "Warning: Specified --iif interface could not be resolved; continuing cleanup.\n");
             }
         }
         return do_stop(pin_dir, &cli_lan);
@@ -1963,19 +2574,19 @@ int main(int argc, char **argv) {
 
         for (int i = 2; i < argc; i++) {
             if (strcmp(argv[i], "--rule-file") == 0) {
-                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
+                if (i + 1 >= argc || argv[i + 1][0] == '-') { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 rule_file = argv[++i];
             } else if (strcmp(argv[i], "--pin-dir") == 0) {
-                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
+                if (i + 1 >= argc || argv[i + 1][0] == '-') { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 pin_dir = argv[++i];
             } else if (strcmp(argv[i], "--wg-endpoint") == 0 || strcmp(argv[i], "--endpoint") == 0) {
-                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
+                if (i + 1 >= argc || argv[i + 1][0] == '-') { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 wg_endpoint = argv[++i];
             } else if (strcmp(argv[i], "--fwmark") == 0) {
-                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
+                if (i + 1 >= argc || argv[i + 1][0] == '-') { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 fwmark = argv[++i];
             } else if (strcmp(argv[i], "--oif") == 0 || strcmp(argv[i], "--egress-dev") == 0 || strcmp(argv[i], "--wg-dev") == 0) {
-                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
+                if (i + 1 >= argc || argv[i + 1][0] == '-') { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 oif_dev = argv[++i];
             } else {
                 fprintf(stderr, "Unknown argument '%s'\n", argv[i]);
@@ -1992,10 +2603,10 @@ int main(int argc, char **argv) {
         const char *ep_str = NULL;
         for (int i = 2; i < argc; i++) {
             if (strcmp(argv[i], "--pin-dir") == 0) {
-                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
+                if (i + 1 >= argc || argv[i + 1][0] == '-') { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 pin_dir = argv[++i];
             } else if ((strcmp(argv[i], "--wg-endpoint") == 0 || strcmp(argv[i], "--endpoint") == 0)) {
-                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
+                if (i + 1 >= argc || argv[i + 1][0] == '-') { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 ep_str = argv[++i];
             } else if (!ep_str && argv[i][0] != '-') {
                 ep_str = argv[i];
@@ -2013,7 +2624,7 @@ int main(int argc, char **argv) {
     } else if (strcmp(cmd, "del-endpoint") == 0 || strcmp(cmd, "unset-endpoint") == 0 || strcmp(cmd, "clear-endpoint") == 0) {
         for (int i = 2; i < argc; i++) {
             if (strcmp(argv[i], "--pin-dir") == 0) {
-                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
+                if (i + 1 >= argc || argv[i + 1][0] == '-') { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 pin_dir = argv[++i];
             } else if (argv[i][0] != '-') {
                 /* ignore */
@@ -2028,10 +2639,10 @@ int main(int argc, char **argv) {
         const char *oif_name = NULL;
         for (int i = 2; i < argc; i++) {
             if (strcmp(argv[i], "--pin-dir") == 0) {
-                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
+                if (i + 1 >= argc || argv[i + 1][0] == '-') { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 pin_dir = argv[++i];
             } else if (strcmp(argv[i], "--oif") == 0) {
-                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
+                if (i + 1 >= argc || argv[i + 1][0] == '-') { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 oif_name = argv[++i];
             } else if (!oif_name && argv[i][0] != '-') {
                 oif_name = argv[i];
@@ -2049,7 +2660,7 @@ int main(int argc, char **argv) {
     } else if (strcmp(cmd, "del-oif") == 0 || strcmp(cmd, "unset-oif") == 0 || strcmp(cmd, "clear-oif") == 0) {
         for (int i = 2; i < argc; i++) {
             if (strcmp(argv[i], "--pin-dir") == 0) {
-                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
+                if (i + 1 >= argc || argv[i + 1][0] == '-') { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 pin_dir = argv[++i];
             } else if (argv[i][0] != '-') {
                 /* ignore */
@@ -2062,54 +2673,54 @@ int main(int argc, char **argv) {
         return do_del_oif(pin_dir);
     } else if (strcmp(cmd, "add-iif") == 0 || strcmp(cmd, "add-if") == 0 ||
                strcmp(cmd, "set-iif") == 0 || strcmp(cmd, "add-lan-if") == 0) {
-        const char *if_str = NULL;
+        struct lan_ifaces lan_list = {0};
         for (int i = 2; i < argc; i++) {
             if (strcmp(argv[i], "--pin-dir") == 0) {
-                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
+                if (i + 1 >= argc || argv[i + 1][0] == '-') { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 pin_dir = argv[++i];
             } else if (strcmp(argv[i], "--iif") == 0 || strcmp(argv[i], "--lan-if") == 0 || strcmp(argv[i], "--if") == 0) {
-                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
-                if_str = argv[++i];
-            } else if (!if_str && argv[i][0] != '-') {
-                if_str = argv[i];
+                if (i + 1 >= argc || argv[i + 1][0] == '-') { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
+                add_lan_iface(&lan_list, argv[++i]);
+            } else if (argv[i][0] != '-') {
+                add_lan_iface(&lan_list, argv[i]);
             } else {
                 fprintf(stderr, "Unknown argument '%s'\n", argv[i]);
                 print_usage(argv[0]);
                 return 1;
             }
         }
-        if (!if_str) {
-            fprintf(stderr, "Error: missing interface argument. Usage: %s add-iif <iface[,iface2]> [--pin-dir <path>]\n", argv[0]);
+        if (lan_list.count == 0) {
+            fprintf(stderr, "Error: missing interface argument for add-iif. Specify interface name(s) or 'auto'. Usage: %s add-iif <iface[,iface2]|auto> [--pin-dir <path>]\n", argv[0]);
             return 1;
         }
-        return do_add_iif(if_str, pin_dir);
+        return do_add_iif(&lan_list, pin_dir);
     } else if (strcmp(cmd, "del-iif") == 0 || strcmp(cmd, "del-if") == 0 ||
                strcmp(cmd, "unset-iif") == 0 || strcmp(cmd, "del-lan-if") == 0 || strcmp(cmd, "remove-if") == 0) {
-        const char *if_str = NULL;
+        struct lan_ifaces lan_list = {0};
         for (int i = 2; i < argc; i++) {
             if (strcmp(argv[i], "--pin-dir") == 0) {
-                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
+                if (i + 1 >= argc || argv[i + 1][0] == '-') { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 pin_dir = argv[++i];
             } else if (strcmp(argv[i], "--iif") == 0 || strcmp(argv[i], "--lan-if") == 0 || strcmp(argv[i], "--if") == 0) {
-                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
-                if_str = argv[++i];
-            } else if (!if_str && argv[i][0] != '-') {
-                if_str = argv[i];
+                if (i + 1 >= argc || argv[i + 1][0] == '-') { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
+                add_lan_iface(&lan_list, argv[++i]);
+            } else if (argv[i][0] != '-') {
+                add_lan_iface(&lan_list, argv[i]);
             } else {
                 fprintf(stderr, "Unknown argument '%s'\n", argv[i]);
                 print_usage(argv[0]);
                 return 1;
             }
         }
-        if (!if_str) {
-            fprintf(stderr, "Error: missing interface argument. Usage: %s del-iif <iface[,iface2]> [--pin-dir <path>]\n", argv[0]);
+        if (lan_list.count == 0) {
+            fprintf(stderr, "Error: missing interface argument for del-iif. Specify interface name(s) or 'all'. Usage: %s del-iif <iface[,iface2]|all> [--pin-dir <path>]\n", argv[0]);
             return 1;
         }
-        return do_del_iif(if_str, pin_dir);
+        return do_del_iif(&lan_list, pin_dir);
     } else if (strcmp(cmd, "status") == 0) {
         for (int i = 2; i < argc; i++) {
             if (strcmp(argv[i], "--pin-dir") == 0) {
-                if (i + 1 >= argc) { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
+                if (i + 1 >= argc || argv[i + 1][0] == '-') { fprintf(stderr, "Error: Option '%s' requires an argument\n", argv[i]); return 1; }
                 pin_dir = argv[++i];
             } else {
                 fprintf(stderr, "Unknown argument '%s'\n", argv[i]);
@@ -2123,5 +2734,10 @@ int main(int argc, char **argv) {
         print_usage(argv[0]);
         return 1;
     }
+}
+
+#ifndef UNIT_TESTING
+int main(int argc, char **argv) {
+    return router_ctl_main(argc, argv);
 }
 #endif

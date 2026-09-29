@@ -78,6 +78,7 @@ struct router_config {
     __u32 enabled;
     __u32 oif_src_ip4;     /* Network byte order; 0 = disabled */
     __u32 oif_src_ip6[4];  /* Network byte order; all 0 = disabled */
+    char  oif_name[IFNAMSIZ];
 };
 
 struct ipv4_lpm_key {

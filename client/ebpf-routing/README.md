@@ -102,6 +102,9 @@ sudo ./router-ctl.sh start \
     --iif eth1,eth2    # 对齐入接口 (iif) 与出接口 (oif)，亦兼容 --lan-if
 ```
 
+> [!WARNING]
+> **多网卡路由器防反向分流警告**：在多网卡软路由（例如 WAN 为 `eth0`，LAN 为 `eth1`）环境下，系统的默认路由指向 WAN 口。若指定 `--iif auto`、`default` 或 `primary`，系统将自动绑定至默认路由接口（即 WAN 口），导致 TC Ingress 挂载到外网入口引发路由颠倒！在多网卡网关上，**请务必显式指定局域网入接口**（例如 `--iif eth1` 或 `--iif eth1,eth2`）。
+
 > [!TIP]
 > 当作为局域网网关转发时，请确保开启了内核转发：
 > `sudo sysctl -w net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1`
@@ -112,7 +115,10 @@ sudo ./router-ctl.sh start \
 - `--cgroup-path <path>`：cgroup v2 挂载路径（默认 `/sys/fs/cgroup`）。
 - `--pin-dir <path>`：（可选）BPF 对象持久化 Pin 目录（默认 `/sys/fs/bpf/wg_routing`）。
 - `--oif <iface>`：（可选）分流目标出接口（Outbound Interface，如 `wg0`），自动提取其源 IP 注入本地 UDP 发包；不指定则为纯 FWMARK 模式。
-- `--iif <iface>`：（可选）绑定分流入口网卡（Inbound Interface，如局域网网口），启用 TC Ingress 分流，支持重复或逗号分隔（如 `eth1,eth2` 或 `eth1`；兼容历史别名 `--lan-if`）。
+- `--iif <iface>`：（可选）绑定分流入口网卡（Inbound Interface，如局域网网口），启用 TC Ingress 分流。
+  - **参数必须显式提供**：如 `--iif auto`、`--iif default`、`--iif primary`（自动探测默认路由网卡）或 `--iif eth1`。若指定 `--iif` 但省略参数将报错。
+  - 支持显式指定具体网卡名称，支持重复或逗号分隔（如 `--iif eth1,eth2` 或 `--iif eth1 --iif eth2`；兼容历史别名 `--lan-if`）。
+  - 若完全不提供 `--iif` 选项，则保持“仅本机分流（Local-only）”安全模式，不干扰物理网卡。
 - `--wg-endpoint <IP[:Port]>`：WireGuard 服务端地址（防死锁回环）。
   - 支持带端口：如 `198.51.100.1:51820` 或 `[2001:db8::1]:51820`（仅匹配指定端口）。
   - **支持不带端口**：如 `198.51.100.1` 或 `2001:db8::1`（匹配该 IP 的所有端口全部放行直连）。
@@ -174,13 +180,24 @@ sudo ./router-ctl.sh del-oif
 无需重启路由器，支持热插拔网卡或动态将入接口纳入/移出 TC Ingress 分流（与 `--oif` / `set-oif` 严格对称，并向后兼容 `add-if` / `del-if`）：
 
 ```bash
-# 动态添加一个或多个入接口（支持逗号分隔）
+# 动态添加系统默认网卡（必须显式指定 auto、default 或 primary）
+sudo ./router-ctl.sh add-iif auto
+
+# 动态添加一个或多个具体入接口（支持空格分隔或逗号分隔）
 sudo ./router-ctl.sh add-iif eth3
 sudo ./router-ctl.sh add-iif eth4,eth5
+sudo ./router-ctl.sh add-iif eth4 eth5
 
 # 动态移出入接口并卸载 TC Ingress 过滤器
 sudo ./router-ctl.sh del-iif eth3
+sudo ./router-ctl.sh del-iif eth4,eth5
+
+# 一键卸载所有已挂载并纳管的局域网入接口
+sudo ./router-ctl.sh del-iif all
 ```
+
+> [!NOTE]
+> `del-iif` 严格要求显式提供具体网卡名称（如 `eth3`）或 `all`（一键卸载全部已纳管接口）；为防止在多网卡软路由环境下误卸载外网出口/默认路由，`del-iif` 禁止传入 `auto`、`default` 或 `primary`。
 
 ### 8. 停止并清理
 
